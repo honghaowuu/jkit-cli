@@ -1,6 +1,11 @@
 use jkit::standards::config::ProjectInfo;
 use jkit::standards::gates::{evaluate, GateOutcome, RuleFile};
 use std::path::PathBuf;
+use std::process::Command;
+
+fn jkit_bin() -> std::path::PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_jkit"))
+}
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -61,4 +66,46 @@ fn evaluate_outcomes_are_in_canonical_order() {
             RuleFile::AuthToms,
         ]
     );
+}
+
+#[test]
+fn list_prints_applicable_files_in_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path();
+    std::fs::create_dir_all(project_dir.join("docs")).unwrap();
+    std::fs::copy(
+        fixture("project-info-full.yaml"),
+        project_dir.join("docs/project-info.yaml"),
+    )
+    .unwrap();
+
+    let plugin_root = temp.path().join("plugin");
+    std::fs::create_dir_all(plugin_root.join("docs/standards")).unwrap();
+
+    let output = Command::new(jkit_bin())
+        .arg("standards")
+        .arg("list")
+        .env("JKIT_PLUGIN_ROOT", &plugin_root)
+        .current_dir(project_dir)
+        .output()
+        .expect("run jkit standards list");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    let expected = vec![
+        plugin_root.join("docs/standards/java-coding.md").display().to_string(),
+        plugin_root.join("docs/standards/api.md").display().to_string(),
+        plugin_root.join("docs/standards/exception.md").display().to_string(),
+        plugin_root.join("docs/standards/environment.md").display().to_string(),
+        plugin_root.join("docs/standards/database.md").display().to_string(),
+        plugin_root.join("docs/standards/tenant.md").display().to_string(),
+        plugin_root.join("docs/standards/redis.md").display().to_string(),
+        plugin_root.join("docs/standards/auth-toms.md").display().to_string(),
+    ];
+    assert_eq!(lines, expected);
 }
