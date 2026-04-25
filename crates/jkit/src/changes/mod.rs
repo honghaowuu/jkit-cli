@@ -1,3 +1,5 @@
+pub mod bootstrap;
+pub mod complete;
 pub mod init;
 pub mod status;
 pub mod summary;
@@ -9,6 +11,8 @@ use std::path::PathBuf;
 
 #[derive(Subcommand, Debug)]
 pub enum ChangesCmd {
+    /// Create `docs/changes/{pending,done}/` (with .gitkeep). Idempotent.
+    Bootstrap,
     /// Report pending change files and any in-progress run.
     Status,
     /// Validate change files: non-empty body and frontmatter `domain:` (if set) exists.
@@ -43,10 +47,20 @@ pub enum ChangesCmd {
         #[arg(long)]
         date: Option<String>,
     },
+    /// Close a run: move .change-files entries from pending/ to done/, archive the run
+    /// dir to .jkit/done/, stage the changes, and amend HEAD.
+    Complete {
+        #[arg(long)]
+        run: PathBuf,
+        /// Skip the `git add` + `git commit --amend` step (useful for tests).
+        #[arg(long)]
+        no_amend: bool,
+    },
 }
 
 pub fn run(cmd: ChangesCmd) -> Result<()> {
     match cmd {
+        ChangesCmd::Bootstrap => bootstrap::run(),
         ChangesCmd::Status => status::run(),
         ChangesCmd::Validate { files } => validate::run(files),
         ChangesCmd::Init {
@@ -67,5 +81,6 @@ pub fn run(cmd: ChangesCmd) -> Result<()> {
             gap_domains,
             date,
         }),
+        ChangesCmd::Complete { run, no_amend } => complete::run(&run, no_amend),
     }
 }
