@@ -109,3 +109,35 @@ fn list_prints_applicable_files_in_order() {
     ];
     assert_eq!(lines, expected);
 }
+
+#[test]
+fn list_explain_shows_gate_decisions() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path();
+    std::fs::create_dir_all(project_dir.join("docs")).unwrap();
+    std::fs::copy(
+        fixture("project-info-full.yaml"),
+        project_dir.join("docs/project-info.yaml"),
+    )
+    .unwrap();
+
+    let output = Command::new(jkit_bin())
+        .arg("standards")
+        .arg("list")
+        .arg("--explain")
+        .env("JKIT_PLUGIN_ROOT", project_dir.join("plugin"))
+        .current_dir(project_dir)
+        .output()
+        .expect("run jkit standards list --explain");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("java-coding.md"));
+    assert!(stdout.contains("applies (always)"));
+    assert!(stdout.contains("i18n.md"));
+    assert!(stdout.contains("skipped (i18n.enabled=false)"));
+    assert!(stdout.contains("spring-cloud.md"));
+    assert!(stdout.contains("skipped (spring-cloud.enabled=false)"));
+    assert!(stdout.contains("auth-toms.md"));
+    assert!(stdout.contains("applies (auth.toms.enabled=true)"));
+}
