@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod complete;
+pub mod doctor;
 pub mod init;
 pub mod status;
 pub mod summary;
@@ -56,6 +57,9 @@ pub enum ChangesCmd {
         #[arg(long)]
         no_amend: bool,
     },
+    /// Read-only diagnostic: detect inconsistencies between .change-files,
+    /// docs/changes/{pending,done}/, and active run dirs.
+    Doctor,
 }
 
 pub fn run(cmd: ChangesCmd) -> Result<()> {
@@ -82,5 +86,6 @@ pub fn run(cmd: ChangesCmd) -> Result<()> {
             date,
         }),
         ChangesCmd::Complete { run, no_amend } => complete::run(&run, no_amend),
+        ChangesCmd::Doctor => doctor::run(),
     }
 }
