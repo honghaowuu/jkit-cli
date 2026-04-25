@@ -141,3 +141,62 @@ fn list_explain_shows_gate_decisions() {
     assert!(stdout.contains("auth-toms.md"));
     assert!(stdout.contains("applies (auth.toms.enabled=true)"));
 }
+
+#[test]
+fn init_copies_template_to_docs_project_info_yaml() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path();
+    let plugin_root = temp.path().join("plugin");
+    std::fs::create_dir_all(plugin_root.join("docs")).unwrap();
+    std::fs::write(
+        plugin_root.join("docs/project-info.schema.yaml"),
+        "project:\n  name: my-app\n",
+    )
+    .unwrap();
+
+    let output = Command::new(jkit_bin())
+        .arg("standards")
+        .arg("init")
+        .env("JKIT_PLUGIN_ROOT", &plugin_root)
+        .current_dir(project_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written =
+        std::fs::read_to_string(project_dir.join("docs/project-info.yaml")).unwrap();
+    assert!(written.contains("name: my-app"));
+}
+
+#[test]
+fn init_refuses_to_overwrite_without_force() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path();
+    std::fs::create_dir_all(project_dir.join("docs")).unwrap();
+    std::fs::write(project_dir.join("docs/project-info.yaml"), "existing: true\n").unwrap();
+
+    let plugin_root = temp.path().join("plugin");
+    std::fs::create_dir_all(plugin_root.join("docs")).unwrap();
+    std::fs::write(
+        plugin_root.join("docs/project-info.schema.yaml"),
+        "project:\n  name: x\n",
+    )
+    .unwrap();
+
+    let output = Command::new(jkit_bin())
+        .arg("standards")
+        .arg("init")
+        .env("JKIT_PLUGIN_ROOT", &plugin_root)
+        .current_dir(project_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let preserved =
+        std::fs::read_to_string(project_dir.join("docs/project-info.yaml")).unwrap();
+    assert_eq!(preserved, "existing: true\n");
+}

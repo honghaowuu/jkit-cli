@@ -1,5 +1,6 @@
 pub mod config;
 pub mod gates;
+pub mod init;
 pub mod list;
 
 use anyhow::Result;
@@ -24,6 +25,6 @@ pub enum StandardsCmd {
 pub fn run(cmd: StandardsCmd) -> Result<()> {
     match cmd {
         StandardsCmd::List { explain } => list::run(explain),
-        StandardsCmd::Init { force: _ } => anyhow::bail!("not implemented yet (Task 6)"),
+        StandardsCmd::Init { force } => init::run(force),
     }
 }
