@@ -200,3 +200,24 @@ fn init_refuses_to_overwrite_without_force() {
         std::fs::read_to_string(project_dir.join("docs/project-info.yaml")).unwrap();
     assert_eq!(preserved, "existing: true\n");
 }
+
+#[test]
+fn list_errors_clearly_when_project_info_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path();
+    let plugin_root = temp.path().join("plugin");
+    std::fs::create_dir_all(plugin_root.join("docs/standards")).unwrap();
+
+    let output = Command::new(jkit_bin())
+        .arg("standards")
+        .arg("list")
+        .env("JKIT_PLUGIN_ROOT", &plugin_root)
+        .current_dir(project_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("project-info.yaml"));
+    assert!(stderr.contains("jkit standards init"));
+}
