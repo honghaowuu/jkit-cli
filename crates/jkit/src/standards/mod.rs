@@ -1,4 +1,5 @@
 pub mod config;
+pub mod gates;
 
 use anyhow::Result;
 use clap::Subcommand;
