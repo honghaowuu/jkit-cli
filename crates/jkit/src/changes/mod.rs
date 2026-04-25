@@ -1,0 +1,71 @@
+pub mod init;
+pub mod status;
+pub mod summary;
+pub mod validate;
+
+use anyhow::Result;
+use clap::Subcommand;
+use std::path::PathBuf;
+
+#[derive(Subcommand, Debug)]
+pub enum ChangesCmd {
+    /// Report pending change files and any in-progress run.
+    Status,
+    /// Validate change files: non-empty body and frontmatter `domain:` (if set) exists.
+    Validate {
+        /// Specific files (relative to cwd or absolute). Default: all under docs/changes/pending/.
+        #[arg(long, value_delimiter = ',')]
+        files: Option<Vec<PathBuf>>,
+    },
+    /// Create `.jkit/<date>-<feature>/` and write `.change-files`. Idempotent on identical input.
+    Init {
+        #[arg(long)]
+        feature: String,
+        /// Comma-separated change-file basenames to record.
+        #[arg(long, value_delimiter = ',', required = true)]
+        files: Vec<String>,
+        /// Date prefix override (default: today, format YYYY-MM-DD).
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// Emit a `change-summary.md` skeleton into the run dir with deterministic fields filled.
+    Summary {
+        #[arg(long)]
+        run: PathBuf,
+        #[arg(long)]
+        feature: String,
+        /// Total unimplemented scenarios across all affected domains.
+        #[arg(long, default_value_t = 0)]
+        gap_total: u32,
+        /// Number of affected domains with at least one gap.
+        #[arg(long, default_value_t = 0)]
+        gap_domains: u32,
+        #[arg(long)]
+        date: Option<String>,
+    },
+}
+
+pub fn run(cmd: ChangesCmd) -> Result<()> {
+    match cmd {
+        ChangesCmd::Status => status::run(),
+        ChangesCmd::Validate { files } => validate::run(files),
+        ChangesCmd::Init {
+            feature,
+            files,
+            date,
+        } => init::run(&feature, &files, date.as_deref()),
+        ChangesCmd::Summary {
+            run,
+            feature,
+            gap_total,
+            gap_domains,
+            date,
+        } => summary::run(summary::SummaryArgs {
+            run,
+            feature,
+            gap_total,
+            gap_domains,
+            date,
+        }),
+    }
+}

@@ -1,3 +1,4 @@
+pub mod changes;
 pub mod contract;
 pub mod coverage;
 pub mod migration;

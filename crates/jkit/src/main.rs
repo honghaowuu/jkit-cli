@@ -27,6 +27,10 @@ enum Top {
         #[command(subcommand)]
         cmd: jkit::contract::ContractCmd,
     },
+    Changes {
+        #[command(subcommand)]
+        cmd: jkit::changes::ChangesCmd,
+    },
 }
 
 fn main() -> ExitCode {
@@ -37,6 +41,7 @@ fn main() -> ExitCode {
         Top::Scenarios { cmd } => jkit::scenarios::run(cmd),
         Top::Migration { cmd } => jkit::migration::run(cmd),
         Top::Contract { cmd } => jkit::contract::run(cmd),
+        Top::Changes { cmd } => jkit::changes::run(cmd),
     };
     match result {
         Ok(()) => ExitCode::from(0),
