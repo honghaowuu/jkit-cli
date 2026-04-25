@@ -1,3 +1,5 @@
+pub mod config;
+
 use anyhow::Result;
 use clap::Subcommand;
 
