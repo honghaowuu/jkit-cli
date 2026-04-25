@@ -1,0 +1,11 @@
+{
+  "name": "{{ service_name }}-contract",
+  "version": "{{ version }}",
+  "description": "Service contract for {{ service_name }}",
+  "skills": [
+    {
+      "id": "{{ service_name }}",
+      "path": "skills/{{ service_name }}/SKILL.md"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+# {{ domain_slug }}
+
+Controller: `{{ controller_class }}`
+
+Source: `{{ controller_file }}`
+
+## Endpoints
+
+{% for m in methods %}
+### {{ m.http_method }} {{ m.path }}
+
+{% if m.javadoc_text %}{{ m.javadoc_text }}{% else %}_(no javadoc)_{% endif %}
+
+Method: `{{ m.name }}` (javadoc quality: `{{ m.javadoc_quality }}`)
+
+{% endfor %}

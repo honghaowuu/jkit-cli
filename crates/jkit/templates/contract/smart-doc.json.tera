@@ -1,0 +1,13 @@
+{
+  "outPath": "{{ out_path }}",
+  "openApiAllInOne": true,
+  "sourceCodePaths": [
+    {"path": "src/main/java", "ignore": ""}
+  ],
+  "serverUrl": "http://localhost",
+  "isStrict": false,
+  "allInOne": true,
+  "createDebugPage": false,
+  "packageFilters": "",
+  "showAuthor": false
+}

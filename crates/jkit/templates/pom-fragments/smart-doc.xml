@@ -1,0 +1,8 @@
+<plugin>
+    <groupId>com.ly.smart-doc</groupId>
+    <artifactId>smart-doc-maven-plugin</artifactId>
+    <version>3.0.7</version>
+    <configuration>
+        <configFile>./smart-doc.json</configFile>
+    </configuration>
+</plugin>

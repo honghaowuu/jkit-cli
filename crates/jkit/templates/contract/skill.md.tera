@@ -1,0 +1,41 @@
+---
+name: {{ service_name }}
+description: {{ description }}
+---
+
+# {{ service_name }}
+
+{{ description }}
+
+## Use when
+
+{% for u in use_when %}- {{ u }}
+{% endfor %}
+
+## Invariants
+
+{% for i in invariants %}- {{ i }}
+{% endfor %}
+
+## Not responsible for
+
+{% for n in not_responsible_for %}- {{ n }}
+{% endfor %}
+
+## Domains
+
+{% for d in domains %}- [{{ d }}](../../domains/{{ d }}.md)
+{% endfor %}
+
+## Reference
+
+- OpenAPI: [contract.yaml](../../reference/contract.yaml)
+{% if sdk and sdk.present %}- SDK: `{{ sdk.artifact_id }}` v{{ sdk.version }}{% endif %}
+
+## Authentication
+
+{{ authentication }}
+
+## Keywords
+
+{{ keywords | join(sep=", ") }}
