@@ -35,6 +35,12 @@ enum Top {
         #[command(subcommand)]
         cmd: jkit::standards::StandardsCmd,
     },
+    /// One-shot project bootstrap: changes bootstrap + standards init + scaffold.
+    /// Idempotent — re-running completes only what's missing.
+    Init {
+        #[command(subcommand)]
+        cmd: Option<jkit::init::InitCmd>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -47,6 +53,10 @@ fn main() -> ExitCode {
         Top::Contract { cmd } => jkit::contract::run(cmd),
         Top::Changes { cmd } => jkit::changes::run(cmd),
         Top::Standards { cmd } => jkit::standards::run(cmd),
+        Top::Init { cmd } => match cmd {
+            Some(c) => jkit::init::run(c),
+            None => jkit::init::run_umbrella(),
+        },
     };
     match result {
         Ok(()) => ExitCode::from(0),

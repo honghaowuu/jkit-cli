@@ -1,0 +1,19 @@
+# Auto-detects env layout for JKIT_ENV (default: local).
+#
+# Single-file layout:    .env/local.env
+# Directory layout:      .env/local/db.env  .env/local/kafka.env  …
+#
+# Both layouts are gitignored. See .env/local.env and .env/test.env for
+# examples; pick one layout per project.
+
+_jkit_env="${JKIT_ENV:-local}"
+
+if [ -d ".env/$_jkit_env" ]; then
+  for _jkit_f in .env/"$_jkit_env"/*.env; do
+    [ -f "$_jkit_f" ] && dotenv "$_jkit_f"
+  done
+elif [ -f ".env/$_jkit_env.env" ]; then
+  dotenv ".env/$_jkit_env.env"
+fi
+
+unset _jkit_env _jkit_f

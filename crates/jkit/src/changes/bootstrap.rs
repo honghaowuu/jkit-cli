@@ -7,8 +7,8 @@ use crate::util::print_json;
 
 #[derive(Serialize, Debug)]
 pub struct BootstrapReport {
-    created: Vec<String>,
-    existing: Vec<String>,
+    pub created: Vec<String>,
+    pub existing: Vec<String>,
 }
 
 pub fn run() -> Result<()> {

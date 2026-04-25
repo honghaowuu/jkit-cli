@@ -1,6 +1,7 @@
 pub mod changes;
 pub mod contract;
 pub mod coverage;
+pub mod init;
 pub mod migration;
 pub mod pom;
 pub mod scenarios;
