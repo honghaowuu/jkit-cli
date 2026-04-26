@@ -1,4 +1,5 @@
 pub mod call_graph;
+pub mod domain_model;
 pub mod infer_domains;
 pub mod parse;
 pub mod scaffold_docs;
@@ -55,6 +56,14 @@ pub enum MigrateCmd {
         /// comes from code, 2 levels deep, simple-name resolution).
         #[arg(long)]
         use_call_graph: bool,
+        /// Draft `domain-model.md` per slug by reading `@Entity` /
+        /// `@TableName` classes via tree-sitter-java. Selects entities by
+        /// package proximity to the slug's controllers and by mention in
+        /// `api-implement-logic.md`. Falls back to the placeholder skeleton
+        /// on parse failure. Re-running overwrites previously auto-drafted
+        /// files but skips files that look hand-edited.
+        #[arg(long)]
+        draft_domain_model: bool,
     },
 }
 
@@ -68,6 +77,7 @@ pub fn run(cmd: MigrateCmd) -> Result<()> {
             domain_map,
             use_smartdoc,
             use_call_graph,
+            draft_domain_model,
         } => scaffold_docs::run(
             &src,
             &pom,
@@ -75,6 +85,7 @@ pub fn run(cmd: MigrateCmd) -> Result<()> {
             domain_map.as_deref(),
             use_smartdoc,
             use_call_graph,
+            draft_domain_model,
         ),
     }
 }

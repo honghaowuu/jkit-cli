@@ -6,7 +6,8 @@ use std::path::Path;
 
 use crate::contract::service_meta::{self, Controller, MethodMeta};
 use crate::domain_layout::{self, ApiType};
-use crate::migrate::{call_graph, smartdoc};
+use crate::migrate::parse::ClassDecl;
+use crate::migrate::{call_graph, domain_model, parse, smartdoc};
 use crate::util::{atomic_write, print_json};
 
 #[derive(Serialize)]
@@ -29,6 +30,15 @@ struct DomainReport {
     /// Files written at the slug root (same regardless of multi-type).
     shared_files_created: Vec<String>,
     shared_files_existing: Vec<String>,
+    /// Source pass that produced `domain-model.md`. `"placeholder"` when the
+    /// `--draft-domain-model` flag is off or fell back; `"tree-sitter"` when
+    /// the entity-driven draft was written; `"skipped"` when the file already
+    /// existed and looked hand-edited.
+    domain_model_source: &'static str,
+    /// Simple names of `@Entity` classes that exist in source but didn't
+    /// match this domain's selection rules. Empty unless
+    /// `--draft-domain-model` ran.
+    domain_model_excluded: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +74,7 @@ pub fn run(
     domain_map_path: Option<&Path>,
     use_smartdoc: bool,
     use_call_graph: bool,
+    draft_domain_model: bool,
 ) -> Result<()> {
     let meta = service_meta::compute(pom, src_root)
         .context("scanning controllers via service_meta::compute")?;
@@ -148,6 +159,65 @@ pub fn run(
             HashMap::new()
         };
 
+    // Entity extraction for --draft-domain-model. Done once before the
+    // per-slug loop; each slug filters this list via select_entities_for_slug.
+    // On parse failure we keep the warnings but treat the entity list as empty
+    // — the per-slug branch will fall back to the placeholder.
+    let all_entities_owned: Vec<ClassDecl> = if draft_domain_model {
+        match parse::parse_dir(src_root) {
+            Ok(files) => {
+                let classes: Vec<ClassDecl> = files
+                    .iter()
+                    .flat_map(|f| parse::extract_classes(f))
+                    .collect();
+                classes
+                    .into_iter()
+                    .filter(|c| {
+                        c.annotations
+                            .iter()
+                            .any(|a| domain_model::ENTITY_ANNOTATIONS.contains(&a.name.as_str()))
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "draft-domain-model: tree-sitter parse failed; falling back to placeholder for all domains: {e}"
+                ));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let all_entities: Vec<&ClassDecl> = all_entities_owned.iter().collect();
+
+    // Pre-pass: which entities does each slug claim? An entity claimed by
+    // some slug must NOT appear in another slug's "excluded — review" list.
+    // Without this, every domain-model.md would list every other domain's
+    // entities as candidates to consider — pure noise. The orphan warning
+    // (top-level) reuses this set to find entities no slug claimed.
+    let claimed_anywhere: std::collections::HashSet<String> = if draft_domain_model {
+        let mut out = std::collections::HashSet::new();
+        for (slug, by_type) in &by_slug_type {
+            let controllers: Vec<&Controller> =
+                by_type.values().flat_map(|v| v.iter().copied()).collect();
+            let api_types: Vec<ApiType> = by_type.keys().copied().collect();
+            let paths_pre = domain_layout::paths_for(out_dir, slug, &api_types);
+            let impl_text = read_impl_logic_for_slug(out_dir, slug, &paths_pre);
+            let sel = domain_model::select_entities_for_slug(
+                &controllers,
+                &all_entities,
+                impl_text.as_deref(),
+            );
+            for c in sel.selected {
+                out.insert(c.simple_name.clone());
+            }
+        }
+        out
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let mut report = ScaffoldReport {
         domains: Vec::new(),
         warnings,
@@ -166,13 +236,59 @@ pub fn run(
         // scaffold-docs only handles domain-model.md here.
         let mut shared_created = Vec::new();
         let mut shared_existing = Vec::new();
-        if paths.domain_model.exists() {
+        let mut domain_model_excluded: Vec<String> = Vec::new();
+        let domain_model_source: &'static str = if draft_domain_model {
+            // Read existing impl-logic.md (if any) so name-mention selection
+            // works even before this run regenerated it. If multi-type, this
+            // is per-bucket and may not exist at the slug root — the helper
+            // below globs every bucket's impl-logic.md.
+            let impl_logic_text = read_impl_logic_for_slug(out_dir, slug, &paths);
+            let controllers_in_slug: Vec<&Controller> = by_type
+                .values()
+                .flat_map(|v| v.iter().copied())
+                .collect();
+            let mut selection = domain_model::select_entities_for_slug(
+                &controllers_in_slug,
+                &all_entities,
+                impl_logic_text.as_deref(),
+            );
+            // Drop entities other slugs claim — those aren't review candidates
+            // for this slug, they belong elsewhere.
+            selection.excluded_simple_names.retain(|n| !claimed_anywhere.contains(n.as_str()));
+            domain_model_excluded.clone_from(&selection.excluded_simple_names);
+            let body = domain_model::render(slug, &selection);
+
+            if paths.domain_model.exists() {
+                let existing = fs::read_to_string(&paths.domain_model).unwrap_or_default();
+                if domain_model::looks_human_edited(&existing) {
+                    report.warnings.push(format!(
+                        "draft-domain-model: {} exists with human edits; skipping",
+                        paths.domain_model.display()
+                    ));
+                    shared_existing.push("domain-model.md".to_string());
+                    "skipped"
+                } else {
+                    atomic_write(&paths.domain_model, body.as_bytes())
+                        .with_context(|| format!("writing {}", paths.domain_model.display()))?;
+                    // Auto-drafted re-runs don't surface in created/existing;
+                    // they're a deterministic refresh. Keep the lists tidy.
+                    "tree-sitter"
+                }
+            } else {
+                atomic_write(&paths.domain_model, body.as_bytes())
+                    .with_context(|| format!("writing {}", paths.domain_model.display()))?;
+                shared_created.push("domain-model.md".to_string());
+                "tree-sitter"
+            }
+        } else if paths.domain_model.exists() {
             shared_existing.push("domain-model.md".to_string());
+            "placeholder"
         } else {
             atomic_write(&paths.domain_model, render_domain_model(slug).as_bytes())
                 .with_context(|| format!("writing {}", paths.domain_model.display()))?;
             shared_created.push("domain-model.md".to_string());
-        }
+            "placeholder"
+        };
 
         let mut buckets: Vec<BucketReport> = Vec::new();
         for (api_type, controllers) in by_type {
@@ -255,10 +371,45 @@ pub fn run(
             buckets,
             shared_files_created: shared_created,
             shared_files_existing: shared_existing,
+            domain_model_source,
+            domain_model_excluded,
         });
     }
 
+    if draft_domain_model {
+        for entity in &all_entities {
+            if !claimed_anywhere.contains(&entity.simple_name) {
+                report.warnings.push(format!(
+                    "draft-domain-model: entity {} not attributable to any slug; consider adding to domain map",
+                    entity.simple_name
+                ));
+            }
+        }
+    }
+
     print_json(&report)
+}
+
+/// Read every `api-implement-logic.md` under the slug's directory tree and
+/// concatenate. Used by `--draft-domain-model` for entity name-mention
+/// matching — multi-type slugs have one file per bucket, single-type slugs
+/// have one at the root. Returns `None` when nothing is readable yet (fresh
+/// scaffold; selection falls back to package-only matching).
+fn read_impl_logic_for_slug(
+    out_dir: &Path,
+    slug: &str,
+    paths: &domain_layout::DomainPaths,
+) -> Option<String> {
+    let _ = out_dir; // future-proof: pass-through for tests that override layout
+    let mut combined = String::new();
+    for per_type in paths.per_type.values() {
+        if let Ok(text) = fs::read_to_string(&per_type.implement_logic) {
+            combined.push_str(&text);
+            combined.push('\n');
+        }
+    }
+    let _ = slug;
+    if combined.is_empty() { None } else { Some(combined) }
 }
 
 fn render_api_spec(slug: &str, controllers: &[&Controller]) -> String {

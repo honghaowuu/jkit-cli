@@ -95,7 +95,7 @@ pub fn run(
         .filter(|c| {
             c.annotations
                 .iter()
-                .any(|a| ENTITY_ANNOTATIONS.contains(&a.as_str()))
+                .any(|a| ENTITY_ANNOTATIONS.contains(&a.name.as_str()))
         })
         .collect();
 
@@ -146,7 +146,7 @@ fn find_dto_candidates<'a>(
         }
         if c.annotations
             .iter()
-            .any(|a| ENTITY_ANNOTATIONS.contains(&a.as_str()))
+            .any(|a| ENTITY_ANNOTATIONS.contains(&a.name.as_str()))
         {
             // Don't pair entities with each other.
             continue;
@@ -217,11 +217,11 @@ fn compare_dto_to_entity(dto: &ClassDecl, entity: &ClassDecl) -> Vec<Conflict> {
         if entity_f
             .annotations
             .iter()
-            .any(|a| a.as_str() == "NotNull")
+            .any(|a| a.name == "NotNull")
             && !dto_f
                 .annotations
                 .iter()
-                .any(|a| VALIDATION_NONNULL.contains(&a.as_str()))
+                .any(|a| VALIDATION_NONNULL.contains(&a.name.as_str()))
         {
             out.push(Conflict {
                 category: "DtoEntityValidation",
@@ -296,7 +296,7 @@ fn group_by_domain_map(
         .filter(|c| {
             c.annotations
                 .iter()
-                .any(|a| ENTITY_ANNOTATIONS.contains(&a.as_str()))
+                .any(|a| ENTITY_ANNOTATIONS.contains(&a.name.as_str()))
         })
         .map(|c| {
             let pkg = c.fqn.rsplitn(2, '.').nth(1).unwrap_or("").to_string();

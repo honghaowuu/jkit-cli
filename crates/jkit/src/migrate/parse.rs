@@ -21,10 +21,12 @@ pub struct JavaFile {
 pub struct ClassDecl {
     pub fqn: String,
     pub simple_name: String,
-    /// Class-level annotation simple names (no `@`, no args). For
-    /// `@RestController @RequestMapping("/foo")` you get
-    /// `["RestController", "RequestMapping"]`.
-    pub annotations: Vec<String>,
+    /// Class-level annotations.
+    pub annotations: Vec<Annotation>,
+    /// First paragraph of the class-level Javadoc block (`/** ... */`)
+    /// immediately preceding the class declaration. `None` when absent or
+    /// empty after stripping leading `*` markers.
+    pub javadoc: Option<String>,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<MethodDecl>,
 }
@@ -36,8 +38,24 @@ pub struct FieldDecl {
     /// `List<Invoice>`. We don't strip generics — the simple-name resolver
     /// peels them off when needed.
     pub type_text: String,
-    /// Field-level annotation simple names (no `@`, no args).
-    pub annotations: Vec<String>,
+    /// Field-level annotations.
+    pub annotations: Vec<Annotation>,
+}
+
+/// An annotation captured by the parser. `name` is the simple form
+/// (`@OneToMany` → `"OneToMany"`); `args_raw` holds the raw text inside the
+/// parentheses for `@Foo(bar = "baz")`-style annotations, or `None` for marker
+/// annotations like `@Entity`.
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub name: String,
+    pub args_raw: Option<String>,
+}
+
+impl Annotation {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -103,9 +121,24 @@ pub fn extract_classes(file: &JavaFile) -> Vec<ClassDecl> {
     let mut out = Vec::new();
     let root = file.tree.root_node();
     let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
+    let children: Vec<Node> = root.children(&mut cursor).collect();
+    for (i, child) in children.iter().enumerate() {
         if child.kind() == "class_declaration" || child.kind() == "interface_declaration" {
-            if let Some(class) = extract_class(child, bytes, file.package.as_deref()) {
+            // The Javadoc block (`/** ... */`) sits as a sibling immediately
+            // before the class_declaration in the program-level child list.
+            let preceding_doc = (0..i)
+                .rev()
+                .find_map(|j| {
+                    let prev = children[j];
+                    match prev.kind() {
+                        "block_comment" | "line_comment" => Some(prev),
+                        _ => None,
+                    }
+                })
+                .filter(|n| n.kind() == "block_comment")
+                .and_then(|n| node_text(n, bytes))
+                .and_then(parse_javadoc_first_paragraph);
+            if let Some(class) = extract_class(*child, bytes, file.package.as_deref(), preceding_doc) {
                 out.push(class);
             }
         }
@@ -113,7 +146,12 @@ pub fn extract_classes(file: &JavaFile) -> Vec<ClassDecl> {
     out
 }
 
-fn extract_class(node: Node, src: &[u8], package: Option<&str>) -> Option<ClassDecl> {
+fn extract_class(
+    node: Node,
+    src: &[u8],
+    package: Option<&str>,
+    javadoc: Option<String>,
+) -> Option<ClassDecl> {
     let simple_name = node
         .child_by_field_name("name")
         .and_then(|n| node_text(n, src).map(str::to_string))?;
@@ -150,24 +188,22 @@ fn extract_class(node: Node, src: &[u8], package: Option<&str>) -> Option<ClassD
         fqn,
         simple_name,
         annotations,
+        javadoc,
         fields,
         methods,
     })
 }
 
 /// Walk the immediate children of `node` (typically a class_declaration or a
-/// field_declaration's `modifiers` child) and collect annotation simple names.
-fn collect_annotations_at(node: Node, src: &[u8]) -> Vec<String> {
+/// field_declaration's `modifiers` child) and collect annotations.
+fn collect_annotations_at(node: Node, src: &[u8]) -> Vec<Annotation> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "marker_annotation" | "annotation" => {
-                if let Some(name) = child
-                    .child_by_field_name("name")
-                    .and_then(|n| node_text(n, src))
-                {
-                    out.push(simple_annotation_name(name));
+                if let Some(a) = read_annotation(child, src) {
+                    out.push(a);
                 }
             }
             "modifiers" => {
@@ -176,10 +212,8 @@ fn collect_annotations_at(node: Node, src: &[u8]) -> Vec<String> {
                 let mut sub = child.walk();
                 for c in child.children(&mut sub) {
                     if matches!(c.kind(), "marker_annotation" | "annotation") {
-                        if let Some(name) =
-                            c.child_by_field_name("name").and_then(|n| node_text(n, src))
-                        {
-                            out.push(simple_annotation_name(name));
+                        if let Some(a) = read_annotation(c, src) {
+                            out.push(a);
                         }
                     }
                 }
@@ -190,8 +224,57 @@ fn collect_annotations_at(node: Node, src: &[u8]) -> Vec<String> {
     out
 }
 
+fn read_annotation(node: Node, src: &[u8]) -> Option<Annotation> {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| node_text(n, src))
+        .map(simple_annotation_name)?;
+    let args_raw = node.child_by_field_name("arguments").and_then(|args| {
+        node_text(args, src).map(|s| {
+            // The arguments node text includes the surrounding parens.
+            let trimmed = s.trim();
+            let inner = trimmed
+                .strip_prefix('(')
+                .and_then(|s| s.strip_suffix(')'))
+                .unwrap_or(trimmed);
+            inner.trim().to_string()
+        })
+    });
+    Some(Annotation { name, args_raw })
+}
+
 fn simple_annotation_name(name: &str) -> String {
     name.rsplit('.').next().unwrap_or(name).to_string()
+}
+
+/// Strip Javadoc `/** ... */` markers and leading `*` per line, return the
+/// first paragraph (text up to the first blank line or `@tag`). `None` when
+/// the input isn't a Javadoc block or the result is empty.
+pub fn parse_javadoc_first_paragraph(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if !raw.starts_with("/**") {
+        return None;
+    }
+    let inner = raw.trim_start_matches("/**").trim_end_matches("*/");
+    let mut lines: Vec<String> = Vec::new();
+    for line in inner.lines() {
+        let trimmed = line.trim().trim_start_matches('*').trim();
+        if trimmed.starts_with('@') {
+            break;
+        }
+        if trimmed.is_empty() {
+            if !lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        lines.push(trimmed.to_string());
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join(" "))
+    }
 }
 
 fn extract_fields(node: Node, src: &[u8]) -> Vec<FieldDecl> {
@@ -459,14 +542,59 @@ public class Invoice {
         let classes = extract_classes(&f);
         assert_eq!(classes.len(), 1);
         let c = &classes[0];
-        assert!(c.annotations.contains(&"Entity".to_string()));
-        assert!(c.annotations.contains(&"Table".to_string()));
+        assert!(c.annotations.iter().any(|a| a.name == "Entity"));
+        let table = c.annotations.iter().find(|a| a.name == "Table").unwrap();
+        assert_eq!(table.args_raw.as_deref(), Some("name = \"invoices\""));
         let id = c.fields.iter().find(|f| f.name == "id").unwrap();
-        assert!(id.annotations.contains(&"Id".to_string()));
-        assert!(id.annotations.contains(&"GeneratedValue".to_string()));
+        assert!(id.annotations.iter().any(|a| a.name == "Id"));
+        assert!(id.annotations.iter().any(|a| a.name == "GeneratedValue"));
         let cust = c.fields.iter().find(|f| f.name == "customerId").unwrap();
-        assert!(cust.annotations.contains(&"NotNull".to_string()));
-        assert!(cust.annotations.contains(&"Column".to_string()));
+        assert!(cust.annotations.iter().any(|a| a.name == "NotNull"));
+        let col = cust.annotations.iter().find(|a| a.name == "Column").unwrap();
+        assert_eq!(col.args_raw.as_deref(), Some("nullable = false"));
+    }
+
+    #[test]
+    fn captures_class_javadoc_first_paragraph() {
+        let dir = TempDir::new().unwrap();
+        let path = write_java(
+            dir.path(),
+            "Invoice.java",
+            r#"
+package com.example;
+
+/**
+ * Invoice issued to a customer for billable services.
+ *
+ * Has line items and a status. Settles via payments.
+ *
+ * @author someone
+ */
+public class Invoice {
+    private Long id;
+}
+"#,
+        );
+        let f = parse_file(&path).unwrap();
+        let classes = extract_classes(&f);
+        assert_eq!(classes.len(), 1);
+        assert_eq!(
+            classes[0].javadoc.as_deref(),
+            Some("Invoice issued to a customer for billable services.")
+        );
+    }
+
+    #[test]
+    fn class_javadoc_none_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = write_java(
+            dir.path(),
+            "Plain.java",
+            "package com.example; public class Plain {}",
+        );
+        let f = parse_file(&path).unwrap();
+        let classes = extract_classes(&f);
+        assert_eq!(classes[0].javadoc, None);
     }
 
     #[test]
