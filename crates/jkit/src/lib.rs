@@ -2,6 +2,7 @@ pub mod changes;
 pub mod conflicts;
 pub mod contract;
 pub mod coverage;
+pub mod domain_layout;
 pub mod drift;
 pub mod envelope;
 pub mod init;
