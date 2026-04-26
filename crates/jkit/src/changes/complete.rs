@@ -13,6 +13,12 @@ pub struct CompleteReport {
     missing: Vec<String>,
     archived_run_dir: String,
     git_amended: bool,
+    /// Populated when one of the git steps (add or amend) fails. The file
+    /// moves and the run-dir archive are independent of git, so a git failure
+    /// surfaces as a non-fatal warning rather than failing the whole command.
+    /// Multiple step errors are joined with `; `.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_error: Option<String>,
 }
 
 pub fn run(run: &Path, no_amend: bool) -> Result<()> {
@@ -97,14 +103,26 @@ pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteRe
         })?;
     }
 
-    let git_amended = if no_amend {
-        false
+    let (git_amended, git_error) = if no_amend {
+        (false, None)
     } else {
         let docs_changes = cwd.join("docs/changes/");
         let jkit_done = cwd.join(".jkit/done/");
-        git_add(&docs_changes);
-        git_add(&jkit_done);
-        git_amend()
+        let mut errors: Vec<String> = Vec::new();
+        if let Err(e) = git_add(&docs_changes) {
+            errors.push(format!("git add docs/changes/: {e}"));
+        }
+        if let Err(e) = git_add(&jkit_done) {
+            errors.push(format!("git add .jkit/done/: {e}"));
+        }
+        let amended = match git_amend() {
+            Ok(()) => true,
+            Err(e) => {
+                errors.push(format!("git commit --amend: {e}"));
+                false
+            }
+        };
+        (amended, if errors.is_empty() { None } else { Some(errors.join("; ")) })
     };
 
     Ok(CompleteReport {
@@ -117,31 +135,44 @@ pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteRe
             .to_string_lossy()
             .into_owned(),
         git_amended,
+        git_error,
     })
 }
 
-fn git_add(path: &Path) -> bool {
-    let out = Command::new("git").arg("add").arg(path).output();
-    matches!(out, Ok(o) if o.status.success())
+/// Returns `Ok(())` when `git add <path>` succeeds and `Err(stderr_text)`
+/// otherwise. Errors are aggregated into the envelope's `git_error` field
+/// rather than dropped to stderr.
+fn git_add(path: &Path) -> std::result::Result<(), String> {
+    match Command::new("git").arg("add").arg(path).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let exit = o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
+            Err(if stderr.is_empty() {
+                format!("git add exited {exit}")
+            } else {
+                format!("git add exited {exit}: {stderr}")
+            })
+        }
+        Err(e) => Err(format!("git add invocation failed: {e}")),
+    }
 }
 
-fn git_amend() -> bool {
-    let out = Command::new("git")
-        .args(["commit", "--amend", "--no-edit"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => true,
+/// Returns `Ok(())` when `git commit --amend --no-edit` succeeds and
+/// `Err(stderr_text)` otherwise.
+fn git_amend() -> std::result::Result<(), String> {
+    match Command::new("git").args(["commit", "--amend", "--no-edit"]).output() {
+        Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {
-            eprintln!(
-                "warning: git commit --amend failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            false
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let exit = o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
+            Err(if stderr.is_empty() {
+                format!("git commit --amend exited {exit}")
+            } else {
+                format!("git commit --amend exited {exit}: {stderr}")
+            })
         }
-        Err(e) => {
-            eprintln!("warning: git commit --amend: {}", e);
-            false
-        }
+        Err(e) => Err(format!("git commit --amend invocation failed: {e}")),
     }
 }
 
