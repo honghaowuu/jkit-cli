@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::contract::service_meta::Controller;
+use crate::domain_layout::ApiType;
 use crate::migrate::parse::{self, ClassDecl, Invocation, JavaFile};
 
 #[derive(Debug)]
@@ -26,23 +27,23 @@ pub struct CallEntry {
     pub children: Vec<CallEntry>,
 }
 
-/// Returns `slug → [controllers]` populated with their resolved call graphs.
-/// Slugs absent from the result either had no controller in the resolved
-/// `class_to_slug` map or no class found in the parsed source — caller falls
-/// back to the regex-rendered impl-logic for them.
+/// Returns `(slug, api_type) → [controllers]` populated with their resolved
+/// call graphs. Buckets absent from the result either had no controller in
+/// the resolved `class_to_slug_type` map or no class found in the parsed
+/// source — caller falls back to the regex-rendered impl-logic for them.
 pub fn build(
     src_root: &Path,
     controllers: &[Controller],
-    class_to_slug: &HashMap<String, String>,
-) -> Result<HashMap<String, Vec<ControllerEntry>>> {
+    class_to_slug_type: &HashMap<String, (String, ApiType)>,
+) -> Result<HashMap<(String, ApiType), Vec<ControllerEntry>>> {
     let files = parse::parse_dir(src_root)?;
     let class_idx = parse::build_class_index(&files);
     let by_fqn = build_fqn_map(&files);
 
-    let mut by_slug: HashMap<String, Vec<ControllerEntry>> = HashMap::new();
+    let mut by_bucket: HashMap<(String, ApiType), Vec<ControllerEntry>> = HashMap::new();
 
     for c in controllers {
-        let Some(slug) = class_to_slug.get(&c.class) else {
+        let Some((slug, api_type)) = class_to_slug_type.get(&c.class) else {
             continue;
         };
         let Some(parsed) = by_fqn.get(&c.class) else {
@@ -71,8 +72,8 @@ pub fn build(
             });
         }
 
-        by_slug
-            .entry(slug.clone())
+        by_bucket
+            .entry((slug.clone(), *api_type))
             .or_default()
             .push(ControllerEntry {
                 class_simple: parsed.simple_name.clone(),
@@ -80,7 +81,7 @@ pub fn build(
             });
     }
 
-    Ok(by_slug)
+    Ok(by_bucket)
 }
 
 fn build_fqn_map(files: &[JavaFile]) -> HashMap<String, ClassDecl> {

@@ -5,15 +5,16 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::contract::service_meta::ServiceMeta;
+use crate::domain_layout::ApiType;
 use crate::pom::prereqs::{self as pom_prereqs};
 use crate::pom::ProfileArg;
 use crate::util::atomic_write;
 
 pub struct SmartdocResult {
-    /// `slug → api-spec.yaml content`. Slugs not present in this map either had
-    /// no matching smartdoc operations or were skipped due to errors — the
-    /// caller falls back to regex-based output for them.
-    pub per_domain_yaml: BTreeMap<String, String>,
+    /// `(slug, api_type) → api-spec.yaml content`. Buckets not present in this
+    /// map either had no matching smartdoc operations or were skipped due to
+    /// errors — the caller falls back to regex-based output for them.
+    pub per_domain_yaml: BTreeMap<(String, ApiType), String>,
     pub matched_operations: usize,
     pub unmatched_operations: usize,
     pub warnings: Vec<String>,
@@ -28,7 +29,7 @@ pub struct SmartdocResult {
 pub fn slice_per_domain(
     pom: &Path,
     meta: &ServiceMeta,
-    class_to_slug: &HashMap<String, String>,
+    class_to_slug_type: &HashMap<String, (String, ApiType)>,
 ) -> Result<SmartdocResult> {
     // Snapshot the pristine project files BEFORE any mutation so the smart-doc
     // plugin install + smart-doc.json write can be undone after we've extracted
@@ -45,7 +46,7 @@ pub fn slice_per_domain(
         None
     };
 
-    let result = slice_per_domain_inner(pom, sd_path, meta, class_to_slug);
+    let result = slice_per_domain_inner(pom, sd_path, meta, class_to_slug_type);
 
     restore_originals(pom, &pom_original, sd_path, smartdoc_original.as_deref());
 
@@ -84,7 +85,7 @@ fn slice_per_domain_inner(
     pom: &Path,
     sd_path: &Path,
     meta: &ServiceMeta,
-    class_to_slug: &HashMap<String, String>,
+    class_to_slug_type: &HashMap<String, (String, ApiType)>,
 ) -> Result<SmartdocResult> {
     let mut warnings = Vec::new();
 
@@ -143,8 +144,10 @@ fn slice_per_domain_inner(
         }
     }
 
-    let mut per_domain_paths: BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
-        BTreeMap::new();
+    let mut per_domain_paths: BTreeMap<
+        (String, ApiType),
+        serde_json::Map<String, serde_json::Value>,
+    > = BTreeMap::new();
     let mut matched: usize = 0;
     let mut unmatched: usize = 0;
 
@@ -162,15 +165,17 @@ fn slice_per_domain_inner(
                     continue;
                 }
                 let key = (method_k.to_uppercase(), normalize_path(path_str));
-                let slug = ep_to_class
+                let bucket = ep_to_class
                     .get(&key)
-                    .and_then(|class| class_to_slug.get(class));
-                let Some(slug) = slug else {
+                    .and_then(|class| class_to_slug_type.get(class));
+                let Some((slug, api_type)) = bucket else {
                     unmatched += 1;
                     continue;
                 };
                 matched += 1;
-                let domain_paths = per_domain_paths.entry(slug.clone()).or_default();
+                let domain_paths = per_domain_paths
+                    .entry((slug.clone(), *api_type))
+                    .or_default();
                 let path_methods = domain_paths
                     .entry(path_str.clone())
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -189,14 +194,19 @@ fn slice_per_domain_inner(
         ));
     }
 
-    let mut per_domain_yaml: BTreeMap<String, String> = BTreeMap::new();
-    for (slug, paths_obj) in per_domain_paths {
+    let mut per_domain_yaml: BTreeMap<(String, ApiType), String> = BTreeMap::new();
+    for ((slug, api_type), paths_obj) in per_domain_paths {
         let mut domain_doc = serde_json::Map::new();
         domain_doc.insert("openapi".into(), openapi_version.clone());
 
         let mut domain_info = info.clone();
         if let Some(info_obj) = domain_info.as_object_mut() {
-            info_obj.insert("title".into(), serde_json::Value::String(slug.clone()));
+            // Title now reflects both slug and API type so consumers reading
+            // the spec can tell which surface they're looking at.
+            info_obj.insert(
+                "title".into(),
+                serde_json::Value::String(format!("{slug} ({})", api_type.dir_name())),
+            );
         }
         domain_doc.insert("info".into(), domain_info);
 
@@ -214,7 +224,7 @@ fn slice_per_domain_inner(
         let value = serde_json::Value::Object(domain_doc);
         let yaml = serde_yaml::to_string(&value)
             .context("converting per-domain OpenAPI doc to YAML")?;
-        per_domain_yaml.insert(slug, yaml);
+        per_domain_yaml.insert((slug, api_type), yaml);
     }
 
     let _ = fs::remove_file(&openapi_json_path);

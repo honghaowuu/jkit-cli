@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::contract::service_meta::{self, Controller, MethodMeta};
+use crate::domain_layout::{self, ApiType};
 use crate::migrate::{call_graph, smartdoc};
 use crate::util::{atomic_write, print_json};
 
@@ -17,6 +18,22 @@ struct ScaffoldReport {
 #[derive(Serialize)]
 struct DomainReport {
     name: String,
+    dir: String,
+    /// `true` when this domain has ≥2 API types and files live in
+    /// `<root>/<api-type>/...` subdirectories. `false` when the single
+    /// detected type stays flat at the domain root.
+    multi_type: bool,
+    /// Per (slug, api_type) bucket. For single-type domains, exactly one
+    /// entry whose `api_type` reflects the detected type.
+    buckets: Vec<BucketReport>,
+    /// Files written at the slug root (same regardless of multi-type).
+    shared_files_created: Vec<String>,
+    shared_files_existing: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BucketReport {
+    api_type: ApiType,
     dir: String,
     files_created: Vec<String>,
     files_existing: Vec<String>,
@@ -40,13 +57,6 @@ struct DomainMapping {
     controllers: Vec<String>,
 }
 
-const FILES: &[&str] = &[
-    "api-spec.yaml",
-    "domain-model.md",
-    "api-implement-logic.md",
-    "test-scenarios.yaml",
-];
-
 pub fn run(
     src_root: &Path,
     pom: &Path,
@@ -69,18 +79,33 @@ pub fn run(
             .collect()
     };
 
-    let mut by_slug: BTreeMap<String, Vec<&Controller>> = BTreeMap::new();
+    // class_fqn -> (slug, api_type). Drives every per-bucket lookup downstream.
+    let class_to_slug_type: HashMap<String, (String, ApiType)> = meta
+        .controllers
+        .iter()
+        .filter_map(|c| {
+            class_to_slug
+                .get(&c.class)
+                .map(|slug| (c.class.clone(), (slug.clone(), c.api_type)))
+        })
+        .collect();
+
+    // slug -> { api_type -> [&Controller] } — drives multi-type vs flat layout.
+    let mut by_slug_type: BTreeMap<String, BTreeMap<ApiType, Vec<&Controller>>> = BTreeMap::new();
     for c in &meta.controllers {
-        if let Some(slug) = class_to_slug.get(&c.class) {
-            by_slug.entry(slug.clone()).or_default().push(c);
+        if class_to_slug.get(&c.class).is_some() {
+            let slug = &class_to_slug[&c.class];
+            by_slug_type
+                .entry(slug.clone())
+                .or_default()
+                .entry(c.api_type)
+                .or_default()
+                .push(c);
         }
     }
 
-    // When --use-smartdoc, run smartdoc once across the whole project and slice
-    // its output per domain; per-domain api-spec.yaml comes from the slice when
-    // the slice has at least one operation, else falls back to regex render.
-    let smartdoc_yaml: BTreeMap<String, String> = if use_smartdoc {
-        match smartdoc::slice_per_domain(pom, &meta, &class_to_slug) {
+    let smartdoc_yaml: BTreeMap<(String, ApiType), String> = if use_smartdoc {
+        match smartdoc::slice_per_domain(pom, &meta, &class_to_slug_type) {
             Ok(result) => {
                 warnings.extend(result.warnings);
                 if result.matched_operations == 0 && result.unmatched_operations == 0 {
@@ -101,110 +126,135 @@ pub fn run(
         BTreeMap::new()
     };
 
-    // When --use-call-graph, build the controller→service call graph once
-    // across all controllers. Per-domain rendering pulls from the slug index.
-    let call_graph_by_slug = if use_call_graph {
-        match call_graph::build(src_root, &meta.controllers, &class_to_slug) {
-            Ok(map) => {
-                if map.is_empty() {
-                    warnings.push(
-                        "call-graph: no controllers parsed via tree-sitter; falling back to skeleton impl-logic for all domains".to_string(),
-                    );
+    let call_graph_by_bucket: HashMap<(String, ApiType), Vec<call_graph::ControllerEntry>> =
+        if use_call_graph {
+            match call_graph::build(src_root, &meta.controllers, &class_to_slug_type) {
+                Ok(map) => {
+                    if map.is_empty() {
+                        warnings.push(
+                            "call-graph: no controllers parsed via tree-sitter; falling back to skeleton impl-logic for all domains".to_string(),
+                        );
+                    }
+                    map
                 }
-                map
+                Err(e) => {
+                    warnings.push(format!(
+                        "call-graph: tree-sitter parse failed; falling back to skeleton impl-logic for all domains: {e}"
+                    ));
+                    HashMap::new()
+                }
             }
-            Err(e) => {
-                warnings.push(format!(
-                    "call-graph: tree-sitter parse failed; falling back to skeleton impl-logic for all domains: {e}"
-                ));
-                std::collections::HashMap::new()
-            }
-        }
-    } else {
-        std::collections::HashMap::new()
-    };
+        } else {
+            HashMap::new()
+        };
 
     let mut report = ScaffoldReport {
         domains: Vec::new(),
         warnings,
     };
 
-    for (slug, controllers) in &by_slug {
-        let dir = out_dir.join(slug);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+    for (slug, by_type) in &by_slug_type {
+        let api_types: Vec<ApiType> = by_type.keys().copied().collect();
+        let paths = domain_layout::paths_for(out_dir, slug, &api_types);
 
-        let mut created = Vec::new();
-        let mut existing = Vec::new();
-        let mut overwritten = Vec::new();
-        let mut api_spec_source = "regex";
-        let mut impl_logic_source = "regex";
+        // Ensure slug root exists (for shared files even when multi-type).
+        fs::create_dir_all(&paths.root)
+            .with_context(|| format!("creating {}", paths.root.display()))?;
 
-        for fname in FILES {
-            let path = dir.join(fname);
-
-            // Two files have content-quality flags that overwrite when their
-            // source is available: api-spec.yaml (smartdoc) and
-            // api-implement-logic.md (call-graph). The other two stay
-            // skip-if-exists so hand-edits survive re-runs.
-            if *fname == "api-spec.yaml" {
-                if let Some(yaml) = smartdoc_yaml.get(slug) {
-                    let was_existing = path.exists();
-                    atomic_write(&path, yaml.as_bytes())
-                        .with_context(|| format!("writing {}", path.display()))?;
-                    if was_existing {
-                        overwritten.push((*fname).to_string());
-                    } else {
-                        created.push((*fname).to_string());
-                    }
-                    api_spec_source = "smartdoc";
-                    continue;
-                }
-            }
-
-            if *fname == "api-implement-logic.md" {
-                if let Some(entries) = call_graph_by_slug.get(slug) {
-                    let body = call_graph::render(slug, entries);
-                    let was_existing = path.exists();
-                    atomic_write(&path, body.as_bytes())
-                        .with_context(|| format!("writing {}", path.display()))?;
-                    if was_existing {
-                        overwritten.push((*fname).to_string());
-                    } else {
-                        created.push((*fname).to_string());
-                    }
-                    impl_logic_source = "call-graph";
-                    continue;
-                }
-            }
-
-            if path.exists() {
-                existing.push((*fname).to_string());
-                continue;
-            }
-            let body = match *fname {
-                "api-spec.yaml" => render_api_spec(slug, controllers),
-                "domain-model.md" => render_domain_model(slug),
-                "api-implement-logic.md" => render_impl_logic(slug, controllers),
-                "test-scenarios.yaml" => render_scenarios(slug, controllers),
-                _ => unreachable!(),
-            };
-            atomic_write(&path, body.as_bytes())
-                .with_context(|| format!("writing {}", path.display()))?;
-            created.push((*fname).to_string());
+        // Shared files (domain-model.md, conflicts.md) at the slug root.
+        // conflicts.md is written by `jkit conflicts report` separately —
+        // scaffold-docs only handles domain-model.md here.
+        let mut shared_created = Vec::new();
+        let mut shared_existing = Vec::new();
+        if paths.domain_model.exists() {
+            shared_existing.push("domain-model.md".to_string());
+        } else {
+            atomic_write(&paths.domain_model, render_domain_model(slug).as_bytes())
+                .with_context(|| format!("writing {}", paths.domain_model.display()))?;
+            shared_created.push("domain-model.md".to_string());
         }
 
-        let method_count: usize = controllers.iter().map(|c| c.methods.len()).sum();
+        let mut buckets: Vec<BucketReport> = Vec::new();
+        for (api_type, controllers) in by_type {
+            let per_type_paths = &paths.per_type[api_type];
+            let bucket_dir = paths.dir_for(*api_type);
+            fs::create_dir_all(&bucket_dir)
+                .with_context(|| format!("creating {}", bucket_dir.display()))?;
+
+            let mut created = Vec::new();
+            let mut existing = Vec::new();
+            let mut overwritten = Vec::new();
+            let mut api_spec_source = "regex";
+            let mut impl_logic_source = "regex";
+
+            // api-spec.yaml: smartdoc overwrites when present, else skeleton (skip-if-exists)
+            if let Some(yaml) = smartdoc_yaml.get(&(slug.clone(), *api_type)) {
+                let was_existing = per_type_paths.api_spec.exists();
+                atomic_write(&per_type_paths.api_spec, yaml.as_bytes())
+                    .with_context(|| format!("writing {}", per_type_paths.api_spec.display()))?;
+                if was_existing {
+                    overwritten.push("api-spec.yaml".to_string());
+                } else {
+                    created.push("api-spec.yaml".to_string());
+                }
+                api_spec_source = "smartdoc";
+            } else if per_type_paths.api_spec.exists() {
+                existing.push("api-spec.yaml".to_string());
+            } else {
+                let body = render_api_spec(slug, controllers);
+                atomic_write(&per_type_paths.api_spec, body.as_bytes())?;
+                created.push("api-spec.yaml".to_string());
+            }
+
+            // api-implement-logic.md: call-graph overwrites when present, else skeleton
+            if let Some(entries) = call_graph_by_bucket.get(&(slug.clone(), *api_type)) {
+                let body = call_graph::render(slug, entries);
+                let was_existing = per_type_paths.implement_logic.exists();
+                atomic_write(&per_type_paths.implement_logic, body.as_bytes())?;
+                if was_existing {
+                    overwritten.push("api-implement-logic.md".to_string());
+                } else {
+                    created.push("api-implement-logic.md".to_string());
+                }
+                impl_logic_source = "call-graph";
+            } else if per_type_paths.implement_logic.exists() {
+                existing.push("api-implement-logic.md".to_string());
+            } else {
+                let body = render_impl_logic(slug, controllers);
+                atomic_write(&per_type_paths.implement_logic, body.as_bytes())?;
+                created.push("api-implement-logic.md".to_string());
+            }
+
+            // test-scenarios.yaml: skeleton, skip-if-exists
+            if per_type_paths.scenarios.exists() {
+                existing.push("test-scenarios.yaml".to_string());
+            } else {
+                let body = render_scenarios(slug, controllers);
+                atomic_write(&per_type_paths.scenarios, body.as_bytes())?;
+                created.push("test-scenarios.yaml".to_string());
+            }
+
+            let method_count: usize = controllers.iter().map(|c| c.methods.len()).sum();
+            buckets.push(BucketReport {
+                api_type: *api_type,
+                dir: bucket_dir.display().to_string(),
+                files_created: created,
+                files_existing: existing,
+                files_overwritten: overwritten,
+                controllers: controllers.iter().map(|c| c.class.clone()).collect(),
+                method_count,
+                api_spec_source,
+                impl_logic_source,
+            });
+        }
+
         report.domains.push(DomainReport {
             name: slug.clone(),
-            dir: dir.display().to_string(),
-            files_created: created,
-            files_existing: existing,
-            files_overwritten: overwritten,
-            controllers: controllers.iter().map(|c| c.class.clone()).collect(),
-            method_count,
-            api_spec_source,
-            impl_logic_source,
+            dir: paths.root.display().to_string(),
+            multi_type: paths.multi_type,
+            buckets,
+            shared_files_created: shared_created,
+            shared_files_existing: shared_existing,
         });
     }
 
