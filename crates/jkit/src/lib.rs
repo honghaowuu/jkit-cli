@@ -3,6 +3,7 @@ pub mod contract;
 pub mod coverage;
 pub mod envelope;
 pub mod init;
+pub mod migrate;
 pub mod migration;
 pub mod pom;
 pub mod scenarios;

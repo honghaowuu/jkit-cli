@@ -2,13 +2,14 @@
 
 Java-specific developer-pipeline CLI. A single Rust binary that owns the deterministic, error-prone halves of a Java/Spring/Maven workflow so model-driven skills don't have to improvise pom mutation, schema diffing, controller scanning, or coverage-loop bookkeeping.
 
-Implements five subcommands described under [`docs/`](docs/):
+Implements six subcommands described under [`docs/`](docs/):
 
 | Subcommand | Owns |
 |---|---|
 | `jkit pom`        | All `pom.xml` mutations — static profile installs and one-off dep adds |
 | `jkit coverage`   | JaCoCo XML filtering + ranking, plus iteration-state plateau detection |
 | `jkit scenarios`  | Spring Boot version detection, test prereq install, scenario gap audit |
+| `jkit migrate`    | Reverse-engineer `docs/domains/<n>/` skeletons from existing `@RestController` classes (legacy onboarding) |
 | `jkit migration`  | Live-DB introspection + target-schema diff, Flyway file placement |
 | `jkit contract`   | Service metadata extraction, smart-doc orchestration, contract bundle staging |
 
