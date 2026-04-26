@@ -14,6 +14,11 @@ struct PlaceReport {
     destination: String,
     next_index: String,
     git_staged: bool,
+    /// Populated when `git add` of the placed file fails (e.g. project isn't a
+    /// git repo). The placement itself is independent of git, so the failure
+    /// is surfaced as a non-fatal warning rather than failing the command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_add_error: Option<String>,
 }
 
 pub fn run(run_dir: &Path, feature: &str, flyway_dir: &Path) -> Result<()> {
@@ -58,13 +63,17 @@ pub fn run(run_dir: &Path, feature: &str, flyway_dir: &Path) -> Result<()> {
     fs::rename(&source, &dest)
         .with_context(|| format!("renaming {} -> {}", source.display(), dest.display()))?;
 
-    let git_staged = git_add(&dest);
+    let (git_staged, git_add_error) = match git_add(&dest) {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
 
     let report = PlaceReport {
         source: source.to_string_lossy().into_owned(),
         destination: dest.to_string_lossy().into_owned(),
         next_index,
         git_staged,
+        git_add_error,
     };
     print_json(&report)
 }
@@ -90,18 +99,22 @@ fn next_index(flyway_dir: &Path) -> Result<String> {
     Ok(format!("{:03}", next))
 }
 
-fn git_add(path: &Path) -> bool {
-    let out = Command::new("git").arg("add").arg(path).output();
-    match out {
-        Ok(o) if o.status.success() => true,
-        Ok(_) => {
-            eprintln!("warning: git add failed");
-            false
+/// Returns `Ok(())` when `git add <path>` succeeds and `Err(stderr_text)`
+/// otherwise. The text is suitable for verbatim inclusion in the JSON
+/// envelope's `git_add_error` field.
+fn git_add(path: &Path) -> std::result::Result<(), String> {
+    match Command::new("git").arg("add").arg(path).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let exit = o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
+            Err(if stderr.is_empty() {
+                format!("git add exited {exit}")
+            } else {
+                format!("git add exited {exit}: {stderr}")
+            })
         }
-        Err(e) => {
-            eprintln!("warning: git add: {}", e);
-            false
-        }
+        Err(e) => Err(format!("git add invocation failed: {e}")),
     }
 }
 

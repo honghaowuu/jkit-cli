@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::util::atomic_write;
+use crate::util::{atomic_write, print_json};
 use model::{CoverageSummary, FilteredMethod, ParsedClass, Report};
 
 #[derive(Parser, Debug)]
@@ -87,7 +87,10 @@ pub fn run(args: CoverageArgs) -> Result<()> {
         methods.truncate(args.top_k);
     }
 
-    let json = if let Some(state_path) = &args.iteration_state {
+    // Build the payload as a JSON Value. The top-level array case
+    // (no --summary, no --iteration-state) is wrapped under `methods` so
+    // the envelope can flatten cleanly.
+    let payload: serde_json::Value = if let Some(state_path) = &args.iteration_state {
         // missed_lines_total = sum of missed_lines.length across all post-filter methods
         // computed BEFORE top_k truncation. The PRD says "after standard v1.0 filtering",
         // and `methods` above is already truncated. Recompute over full filtered set:
@@ -98,46 +101,45 @@ pub fn run(args: CoverageArgs) -> Result<()> {
 
         if args.summary {
             let summary = summarize(&classes);
-            let envelope = AugmentedSummaryReport {
+            serde_json::to_value(AugmentedSummaryReport {
                 base: Report { summary, methods },
                 iteration,
                 missed_lines_total: total,
                 missed_lines_delta: delta,
                 consecutive_no_progress,
                 should_stop,
-            };
-            serialize(&envelope, args.pretty)?
+            })?
         } else {
-            let envelope = AugmentedMethodsReport {
+            serde_json::to_value(AugmentedMethodsReport {
                 methods,
                 iteration,
                 missed_lines_total: total,
                 missed_lines_delta: delta,
                 consecutive_no_progress,
                 should_stop,
-            };
-            serialize(&envelope, args.pretty)?
+            })?
         }
     } else if args.summary {
         let summary = summarize(&classes);
-        serialize(&Report { summary, methods }, args.pretty)?
+        serde_json::to_value(Report { summary, methods })?
     } else {
-        serialize(&methods, args.pretty)?
+        serde_json::json!({ "methods": methods })
     };
 
-    match &args.output {
-        Some(path) => fs::write(path, &json).with_context(|| format!("writing {}", path))?,
-        None => println!("{}", json),
+    if let Some(path) = &args.output {
+        // Serialize the payload as the user asked (pretty/compact) and write
+        // it to disk. The CLI itself emits a small envelope on stdout
+        // pointing at the file so callers don't have to special-case stdout.
+        let body = if args.pretty {
+            serde_json::to_string_pretty(&payload).context("serializing JSON")?
+        } else {
+            serde_json::to_string(&payload).context("serializing JSON")?
+        };
+        fs::write(path, body).with_context(|| format!("writing {}", path))?;
+        return print_json(&serde_json::json!({ "output_path": path }));
     }
-    Ok(())
-}
 
-fn serialize<T: Serialize>(value: &T, pretty: bool) -> Result<String> {
-    if pretty {
-        serde_json::to_string_pretty(value).context("serializing JSON")
-    } else {
-        serde_json::to_string(value).context("serializing JSON")
-    }
+    print_json(&payload)
 }
 
 fn compute_filtered(classes: &[ParsedClass], min_score: f64) -> Vec<FilteredMethod> {

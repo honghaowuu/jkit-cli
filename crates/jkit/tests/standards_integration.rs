@@ -217,7 +217,9 @@ fn list_errors_clearly_when_project_info_missing() {
         .unwrap();
 
     assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("project-info.yaml"));
-    assert!(stderr.contains("jkit standards init"));
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(v["ok"], false);
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("project-info.yaml"), "msg: {msg}");
+    assert!(msg.contains("jkit standards init"), "msg: {msg}");
 }

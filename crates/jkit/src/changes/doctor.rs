@@ -9,7 +9,7 @@ use crate::util::print_json;
 
 #[derive(Serialize, Debug)]
 pub struct DoctorReport {
-    ok: bool,
+    clean: bool,
     findings: Vec<Finding>,
 }
 
@@ -150,8 +150,8 @@ pub fn diagnose(cwd: &Path) -> Result<DoctorReport> {
         }
     }
 
-    let ok = !findings.iter().any(|f| f.severity == "issue");
-    Ok(DoctorReport { ok, findings })
+    let clean = !findings.iter().any(|f| f.severity == "issue");
+    Ok(DoctorReport { clean, findings })
 }
 
 /// Run `git status --porcelain -- <subpath>` and return modified paths.
@@ -266,7 +266,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         write(&tmp.path().join("docs/changes/pending/foo.md"), "x");
         let report = diagnose(tmp.path()).unwrap();
-        assert!(report.ok);
+        assert!(report.clean);
         assert!(report.findings.is_empty());
     }
 
@@ -278,7 +278,7 @@ mod tests {
         write(&tmp.path().join("docs/changes/pending/a.md"), "x");
         write(&tmp.path().join("docs/changes/pending/b.md"), "y");
         let report = diagnose(tmp.path()).unwrap();
-        assert!(!report.ok);
+        assert!(!report.clean);
         assert!(report
             .findings
             .iter()
@@ -291,7 +291,7 @@ mod tests {
         write(&tmp.path().join(".jkit/2026-04-24-a/.change-files"), "a.md\n");
         write(&tmp.path().join("docs/changes/done/a.md"), "x");
         let report = diagnose(tmp.path()).unwrap();
-        assert!(!report.ok);
+        assert!(!report.clean);
         let f = report
             .findings
             .iter()
@@ -305,7 +305,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         write(&tmp.path().join(".jkit/2026-04-24-a/.change-files"), "ghost.md\n");
         let report = diagnose(tmp.path()).unwrap();
-        assert!(!report.ok);
+        assert!(!report.clean);
         assert!(report
             .findings
             .iter()
@@ -324,7 +324,7 @@ mod tests {
         write(&tmp.path().join(".jkit/2026-04-24-a/.change-files"), "real.md\n");
         write(&tmp.path().join("docs/changes/pending/real.md"), "x");
         let r2 = diagnose(tmp.path()).unwrap();
-        assert!(r2.ok); // warning, not issue
+        assert!(r2.clean); // warning, not issue
         assert!(r2
             .findings
             .iter()
@@ -336,7 +336,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         write(&tmp.path().join(".jkit/2026-04-24-a/.change-files"), "");
         let report = diagnose(tmp.path()).unwrap();
-        assert!(!report.ok);
+        assert!(!report.clean);
         assert!(report.findings.iter().any(|f| f.code == "empty_change_files"));
     }
 
@@ -349,7 +349,7 @@ mod tests {
         );
         write(&tmp.path().join("docs/changes/done/old.md"), "x");
         let report = diagnose(tmp.path()).unwrap();
-        assert!(report.ok);
+        assert!(report.clean);
         assert!(report.findings.is_empty());
     }
 
@@ -387,7 +387,7 @@ mod tests {
         write(&tmp.path().join("docs/domains/billing/api-spec.yaml"), "v: 2\n");
 
         let report = diagnose(tmp.path()).unwrap();
-        assert!(report.ok); // warning, not issue
+        assert!(report.clean); // warning, not issue
         assert!(report
             .findings
             .iter()

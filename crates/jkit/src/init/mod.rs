@@ -18,7 +18,6 @@ pub enum InitCmd {
 
 #[derive(Serialize, Debug)]
 struct InitReport {
-    ok: bool,
     steps: Steps,
     next_steps: Vec<String>,
 }
@@ -42,7 +41,6 @@ pub fn run_umbrella() -> Result<()> {
     let next_steps = compose_next_steps(&standards_init, &scaffold);
 
     let report = InitReport {
-        ok: true,
         steps: Steps {
             changes_bootstrap,
             standards_init,

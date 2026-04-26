@@ -13,6 +13,12 @@ pub struct CompleteReport {
     missing: Vec<String>,
     archived_run_dir: String,
     git_amended: bool,
+    /// Populated when one of the git steps (add or amend) fails. The file
+    /// moves and the run-dir archive are independent of git, so a git failure
+    /// surfaces as a non-fatal warning rather than failing the whole command.
+    /// Multiple step errors are joined with `; `.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_error: Option<String>,
 }
 
 pub fn run(run: &Path, no_amend: bool) -> Result<()> {
@@ -22,17 +28,31 @@ pub fn run(run: &Path, no_amend: bool) -> Result<()> {
 }
 
 pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteReport> {
-    let run_dir = if run_arg.is_absolute() {
+    let run_dir_input = if run_arg.is_absolute() {
         run_arg.to_path_buf()
     } else {
         cwd.join(run_arg)
     };
-    if !run_dir.is_dir() {
-        anyhow::bail!("run dir not found: {}", run_dir.display());
+
+    // Resumability: a previous invocation may have already archived the run
+    // dir but failed before (or skipped) the git amend. If the source run dir
+    // is gone but the archived copy exists, treat the move as already done.
+    let done_root = cwd.join(".jkit").join("done");
+    let run_name = run_dir_input
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("run dir has no basename"))?
+        .to_owned();
+    let archived = done_root.join(&run_name);
+
+    let resuming_from_archived = !run_dir_input.exists() && archived.is_dir();
+    let active_run_dir = if resuming_from_archived { &archived } else { &run_dir_input };
+
+    if !active_run_dir.is_dir() {
+        anyhow::bail!("run dir not found: {}", run_dir_input.display());
     }
-    let change_files_path = run_dir.join(".change-files");
+    let change_files_path = active_run_dir.join(".change-files");
     if !change_files_path.is_file() {
-        anyhow::bail!(".change-files missing in {}", run_dir.display());
+        anyhow::bail!(".change-files missing in {}", active_run_dir.display());
     }
 
     let entries: Vec<String> = fs::read_to_string(&change_files_path)
@@ -67,31 +87,42 @@ pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteRe
     }
 
     // Archive run dir under .jkit/done/.
-    let done_root = cwd.join(".jkit").join("done");
     fs::create_dir_all(&done_root)
         .with_context(|| format!("creating {}", done_root.display()))?;
-    let run_name = run_dir
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("run dir has no basename"))?;
-    let archived = done_root.join(run_name);
-    if archived.exists() {
+    if resuming_from_archived {
+        // Already archived by a prior invocation — skip the rename and
+        // proceed to the git step below.
+    } else if archived.exists() {
         anyhow::bail!(
-            "archive collision at {} — run already completed?",
+            "archive collision at {} — both source and archive exist; resolve manually",
             archived.display()
         );
+    } else {
+        fs::rename(&run_dir_input, &archived).with_context(|| {
+            format!("archiving {} -> {}", run_dir_input.display(), archived.display())
+        })?;
     }
-    fs::rename(&run_dir, &archived).with_context(|| {
-        format!("archiving {} -> {}", run_dir.display(), archived.display())
-    })?;
 
-    let git_amended = if no_amend {
-        false
+    let (git_amended, git_error) = if no_amend {
+        (false, None)
     } else {
         let docs_changes = cwd.join("docs/changes/");
         let jkit_done = cwd.join(".jkit/done/");
-        git_add(&docs_changes);
-        git_add(&jkit_done);
-        git_amend()
+        let mut errors: Vec<String> = Vec::new();
+        if let Err(e) = git_add(&docs_changes) {
+            errors.push(format!("git add docs/changes/: {e}"));
+        }
+        if let Err(e) = git_add(&jkit_done) {
+            errors.push(format!("git add .jkit/done/: {e}"));
+        }
+        let amended = match git_amend() {
+            Ok(()) => true,
+            Err(e) => {
+                errors.push(format!("git commit --amend: {e}"));
+                false
+            }
+        };
+        (amended, if errors.is_empty() { None } else { Some(errors.join("; ")) })
     };
 
     Ok(CompleteReport {
@@ -104,31 +135,44 @@ pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteRe
             .to_string_lossy()
             .into_owned(),
         git_amended,
+        git_error,
     })
 }
 
-fn git_add(path: &Path) -> bool {
-    let out = Command::new("git").arg("add").arg(path).output();
-    matches!(out, Ok(o) if o.status.success())
+/// Returns `Ok(())` when `git add <path>` succeeds and `Err(stderr_text)`
+/// otherwise. Errors are aggregated into the envelope's `git_error` field
+/// rather than dropped to stderr.
+fn git_add(path: &Path) -> std::result::Result<(), String> {
+    match Command::new("git").arg("add").arg(path).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let exit = o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
+            Err(if stderr.is_empty() {
+                format!("git add exited {exit}")
+            } else {
+                format!("git add exited {exit}: {stderr}")
+            })
+        }
+        Err(e) => Err(format!("git add invocation failed: {e}")),
+    }
 }
 
-fn git_amend() -> bool {
-    let out = Command::new("git")
-        .args(["commit", "--amend", "--no-edit"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => true,
+/// Returns `Ok(())` when `git commit --amend --no-edit` succeeds and
+/// `Err(stderr_text)` otherwise.
+fn git_amend() -> std::result::Result<(), String> {
+    match Command::new("git").args(["commit", "--amend", "--no-edit"]).output() {
+        Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {
-            eprintln!(
-                "warning: git commit --amend failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            false
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let exit = o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
+            Err(if stderr.is_empty() {
+                format!("git commit --amend exited {exit}")
+            } else {
+                format!("git commit --amend exited {exit}: {stderr}")
+            })
         }
-        Err(e) => {
-            eprintln!("warning: git commit --amend: {}", e);
-            false
-        }
+        Err(e) => Err(format!("git commit --amend invocation failed: {e}")),
     }
 }
 
@@ -210,6 +254,33 @@ mod tests {
         fs::create_dir_all(tmp.path().join(".jkit/done/2026-04-25-feat")).unwrap();
         let err = complete(tmp.path(), &run, true).unwrap_err();
         assert!(err.to_string().contains("archive collision"));
+    }
+
+    #[test]
+    fn resumes_when_only_archive_exists() {
+        // Simulate an interrupted prior run: pending file already moved to
+        // done/, run dir already archived, but git amend never happened. A
+        // re-run should NOT bail; it should pick up the archived run dir,
+        // see all files in done already, and report success.
+        let tmp = tempdir().unwrap();
+        let run = setup(tmp.path(), &["a.md", "b.md"]);
+        // Move the pending files to done as if a prior run did the rename.
+        fs::create_dir_all(tmp.path().join("docs/changes/done")).unwrap();
+        for n in ["a.md", "b.md"] {
+            fs::rename(
+                tmp.path().join(format!("docs/changes/pending/{n}")),
+                tmp.path().join(format!("docs/changes/done/{n}")),
+            )
+            .unwrap();
+        }
+        // Move the run dir to .jkit/done/ as if archived.
+        fs::create_dir_all(tmp.path().join(".jkit/done")).unwrap();
+        fs::rename(&run, tmp.path().join(".jkit/done/2026-04-25-feat")).unwrap();
+
+        let report = complete(tmp.path(), &run, true).expect("resume should succeed");
+        assert_eq!(report.already_done, vec!["a.md", "b.md"]);
+        assert!(report.moved.is_empty());
+        assert!(report.archived_run_dir.ends_with(".jkit/done/2026-04-25-feat"));
     }
 
     #[test]
