@@ -8,28 +8,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::domain_layout::{self, ApiType, DetectedLayout};
 use crate::util::print_json;
 
-#[derive(Debug, Deserialize)]
-struct ScenariosFile(Vec<EndpointGroup>);
-
-#[derive(Debug, Deserialize)]
-struct EndpointGroup {
-    endpoint: String,
-    scenarios: Vec<Scenario>,
-}
-
+/// Canonical test-scenarios.yaml format: top-level sequence of
+/// `{endpoint, id, description}` entries — same shape `kit scenarios sync`
+/// writes and `jkit migrate scaffold-docs` produces. Older nested formats
+/// (`Vec<EndpointGroup>` with grouped scenarios) are no longer recognized;
+/// projects on the legacy format need to flatten manually or re-run sync.
 #[derive(Debug, Deserialize, Clone)]
-struct Scenario {
+struct ScenarioEntry {
+    endpoint: String,
     id: String,
     description: String,
 }
 
 #[derive(Debug, Serialize)]
-struct GapEntrySingle<'a> {
-    endpoint: &'a str,
-    id: &'a str,
-    description: &'a str,
+struct GapEntrySingle {
+    endpoint: String,
+    id: String,
+    description: String,
+    /// `Some(api_type)` when the gap came from a per-type
+    /// `test-scenarios.yaml` under `docs/domains/<slug>/<api-type>/`.
+    /// `None` for flat (single-type) layouts where there's no
+    /// disambiguation to record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_type: Option<ApiType>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,6 +44,8 @@ struct GapEntryAggregated {
     description: String,
     test_class_path: Option<String>,
     test_method_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_type: Option<ApiType>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,24 +76,43 @@ pub fn run(
 }
 
 fn run_single(domain: &str, test_root: &Path) -> Result<()> {
-    let yaml_path = PathBuf::from("docs/domains").join(domain).join("test-scenarios.yaml");
-    if !yaml_path.exists() {
-        // Per PRD: missing → empty gaps list, exit 0.
-        let empty: Vec<GapEntrySingle> = Vec::new();
-        return print_json(&serde_json::json!({ "gaps": empty }));
-    }
-    let groups = load_scenarios(&yaml_path)?;
-    let implemented = implemented_method_names(test_root)?;
+    let domains_root = PathBuf::from("docs/domains");
+    let layout = domain_layout::detect_layout(&domains_root, domain);
 
+    // Resolve which test-scenarios.yaml file(s) to read. Multi-type domains
+    // have one per api_type; single-type stays at the slug root.
+    let buckets: Vec<(Option<ApiType>, PathBuf)> = match &layout {
+        DetectedLayout::MultiType(types) => types
+            .iter()
+            .map(|ty| {
+                (
+                    Some(*ty),
+                    domains_root
+                        .join(domain)
+                        .join(ty.dir_name())
+                        .join("test-scenarios.yaml"),
+                )
+            })
+            .collect(),
+        _ => vec![(None, domains_root.join(domain).join("test-scenarios.yaml"))],
+    };
+
+    let implemented = implemented_method_names(test_root)?;
     let mut out: Vec<GapEntrySingle> = Vec::new();
-    for g in &groups {
-        for s in &g.scenarios {
-            let camel = id_to_camel(&s.id);
+
+    for (api_type, yaml_path) in &buckets {
+        if !yaml_path.exists() {
+            continue;
+        }
+        let entries = load_scenarios(yaml_path)?;
+        for e in &entries {
+            let camel = id_to_camel(&e.id);
             if !implemented.contains(&camel) {
                 out.push(GapEntrySingle {
-                    endpoint: &g.endpoint,
-                    id: &s.id,
-                    description: &s.description,
+                    endpoint: e.endpoint.clone(),
+                    id: e.id.clone(),
+                    description: e.description.clone(),
+                    api_type: *api_type,
                 });
             }
         }
@@ -124,19 +149,36 @@ fn run_aggregated(run_dir: &Path, test_root: &Path, pom_path: &Path) -> Result<(
     let pom_meta = read_pom_coords(pom_path).ok();
 
     let mut out: Vec<GapEntryAggregated> = Vec::new();
+    let domains_root = PathBuf::from("docs/domains");
     for domain in &domains {
-        let yaml_path = PathBuf::from("docs/domains").join(domain).join("test-scenarios.yaml");
-        if !yaml_path.exists() {
-            continue;
-        }
-        let groups = load_scenarios(&yaml_path)?;
-        for g in &groups {
-            for s in &g.scenarios {
-                let camel = id_to_camel(&s.id);
+        let layout = domain_layout::detect_layout(&domains_root, domain);
+        let buckets: Vec<(Option<ApiType>, PathBuf)> = match &layout {
+            DetectedLayout::MultiType(types) => types
+                .iter()
+                .map(|ty| {
+                    (
+                        Some(*ty),
+                        domains_root
+                            .join(domain)
+                            .join(ty.dir_name())
+                            .join("test-scenarios.yaml"),
+                    )
+                })
+                .collect(),
+            _ => vec![(None, domains_root.join(domain).join("test-scenarios.yaml"))],
+        };
+
+        for (api_type, yaml_path) in &buckets {
+            if !yaml_path.exists() {
+                continue;
+            }
+            let entries = load_scenarios(yaml_path)?;
+            for e in &entries {
+                let camel = id_to_camel(&e.id);
                 if implemented.contains(&camel) {
                     continue;
                 }
-                let key = (domain.clone(), g.endpoint.clone(), s.id.clone());
+                let key = (domain.clone(), e.endpoint.clone(), e.id.clone());
                 if skipped.contains(&key) {
                     continue;
                 }
@@ -144,11 +186,12 @@ fn run_aggregated(run_dir: &Path, test_root: &Path, pom_path: &Path) -> Result<(
                     resolve_test_class_path(test_root, domain, pom_meta.as_ref());
                 out.push(GapEntryAggregated {
                     domain: domain.clone(),
-                    endpoint: g.endpoint.clone(),
-                    id: s.id.clone(),
-                    description: s.description.clone(),
+                    endpoint: e.endpoint.clone(),
+                    id: e.id.clone(),
+                    description: e.description.clone(),
                     test_class_path,
                     test_method_name: camel,
+                    api_type: *api_type,
                 });
             }
         }
@@ -156,11 +199,15 @@ fn run_aggregated(run_dir: &Path, test_root: &Path, pom_path: &Path) -> Result<(
     print_json(&serde_json::json!({ "gaps": out }))
 }
 
-fn load_scenarios(path: &Path) -> Result<Vec<EndpointGroup>> {
+fn load_scenarios(path: &Path) -> Result<Vec<ScenarioEntry>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed: ScenariosFile = serde_yaml::from_str(&text)
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(Vec::new());
+    }
+    let parsed: Vec<ScenarioEntry> = serde_yaml::from_str(&text)
         .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(parsed.0)
+    Ok(parsed)
 }
 
 /// Convert a kebab-case id to camelCase.

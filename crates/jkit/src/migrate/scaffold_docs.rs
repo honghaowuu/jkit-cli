@@ -375,29 +375,31 @@ fn render_impl_logic(slug: &str, controllers: &[&Controller]) -> String {
 }
 
 fn render_scenarios(slug: &str, controllers: &[&Controller]) -> String {
+    // Format matches `kit scenarios sync` (kit-core's canonical writer):
+    // top-level YAML sequence of {endpoint, id, description}. Same shape
+    // `jkit scenarios gap` reads.
     let mut s = format!(
         "# Scenarios for {slug}. Auto-scaffolded by `jkit migrate scaffold-docs`.\n\
-         # Refine via /spec-delta + scenario-tdd.\n\
-         scenarios:\n"
+         # Refine via /spec-delta + scenario-tdd.\n"
     );
     let mut emitted = false;
     for c in controllers {
         for m in &c.methods {
             if let (Some(http), Some(p)) = (&m.http_method, &m.path) {
                 emitted = true;
-                s.push_str(&format!("  - id: {}-happy\n", m.name));
-                s.push_str(&format!("    endpoint: {http} {p}\n"));
+                s.push_str(&format!("- endpoint: {http} {p}\n"));
+                s.push_str(&format!("  id: {}-happy\n", m.name));
                 s.push_str(&format!(
-                    "    description: {}\n",
+                    "  description: {}\n",
                     quote_yaml(&format!("{} happy path", m.name))
                 ));
-                s.push_str("    # TODO: add error / auth / validation cases\n");
+                s.push_str("  # TODO: add error / auth / validation cases\n");
             }
         }
     }
     if !emitted {
         // Empty list — keep YAML valid.
-        s.push_str("  []\n");
+        s.push_str("[]\n");
     }
     s
 }
