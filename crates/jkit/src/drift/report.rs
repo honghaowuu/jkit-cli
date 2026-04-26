@@ -1,11 +1,39 @@
 use anyhow::{Context, Result};
-use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
 use crate::contract::service_meta::{self, Controller};
+use crate::domain_layout::{self, ApiType, DetectedLayout};
 use crate::util::print_json;
+
+#[derive(Deserialize)]
+struct DomainMap {
+    #[allow(dead_code)]
+    schema_version: Option<u32>,
+    domains: Vec<DomainMapping>,
+}
+
+#[derive(Deserialize)]
+struct DomainMapping {
+    slug: String,
+    controllers: Vec<String>,
+}
+
+fn load_class_to_slug(path: &Path) -> Result<HashMap<String, String>> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed: DomainMap = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {} as domain map", path.display()))?;
+    let mut out = HashMap::new();
+    for d in parsed.domains {
+        for c in d.controllers {
+            out.insert(c, d.slug.clone());
+        }
+    }
+    Ok(out)
+}
 
 #[derive(Serialize)]
 struct DriftReport {
@@ -16,22 +44,32 @@ struct DriftReport {
 #[derive(Serialize)]
 struct DomainDrift {
     name: String,
+    /// `true` when this domain has ≥2 API types and per-type subdirectories
+    /// are in use on disk. Findings still appear in the flat lists below
+    /// but each carries an `api_type` tag for routing.
+    multi_type: bool,
     matched: usize,
     controllers_without_spec: Vec<EndpointWithSource>,
     spec_without_controllers: Vec<EndpointEntry>,
+    /// `true` if at least one api-spec.yaml was found across types.
     spec_yaml_present: bool,
+    /// Per-API-type breakdown of `api-spec.yaml` presence. Single-type domains
+    /// emit one entry; multi-type domains emit one per type checked.
+    spec_yaml_present_by_type: BTreeMap<ApiType, bool>,
 }
 
 #[derive(Serialize)]
 struct EndpointEntry {
     http: String,
     path: String,
+    api_type: ApiType,
 }
 
 #[derive(Serialize)]
 struct EndpointWithSource {
     http: String,
     path: String,
+    api_type: ApiType,
     controller: String,
     method: String,
 }
@@ -41,24 +79,44 @@ pub fn run(
     src_root: &Path,
     pom: &Path,
     domains_root: &Path,
+    domain_map_path: Option<&Path>,
 ) -> Result<()> {
     let meta = service_meta::compute(pom, src_root)
         .context("scanning controllers via service_meta::compute")?;
 
-    let mut by_slug: BTreeMap<String, Vec<&Controller>> = BTreeMap::new();
+    // class FQN -> resolved slug (from domain map if provided, else
+    // controller's auto-derived slug).
+    let class_to_slug: HashMap<String, String> = if let Some(p) = domain_map_path {
+        load_class_to_slug(p)?
+    } else {
+        meta.controllers
+            .iter()
+            .map(|c| (c.class.clone(), c.domain_slug.clone()))
+            .collect()
+    };
+
+    // slug -> { api_type -> [&Controller] }. Drives per-type drift checks.
+    let mut by_slug: BTreeMap<String, BTreeMap<ApiType, Vec<&Controller>>> = BTreeMap::new();
     for c in &meta.controllers {
-        by_slug.entry(c.domain_slug.clone()).or_default().push(c);
+        let slug = class_to_slug
+            .get(&c.class)
+            .cloned()
+            .unwrap_or_else(|| c.domain_slug.clone());
+        by_slug
+            .entry(slug)
+            .or_default()
+            .entry(c.api_type)
+            .or_default()
+            .push(c);
     }
 
     if let Some(d) = domain_filter {
         by_slug.retain(|k, _| k == d);
         if domains_root.join(d).exists() && !by_slug.contains_key(d) {
-            // Domain dir exists with no controllers — still report spec-only drift.
             by_slug.entry(d.to_string()).or_default();
         }
     }
 
-    // Also include domains that have an api-spec.yaml but no controllers.
     if domain_filter.is_none() && domains_root.exists() {
         if let Ok(entries) = fs::read_dir(domains_root) {
             for e in entries.flatten() {
@@ -76,75 +134,104 @@ pub fn run(
         warnings: Vec::new(),
     };
 
-    for (slug, controllers) in &by_slug {
-        let spec_path = domains_root.join(slug).join("api-spec.yaml");
-        let spec_present = spec_path.exists();
-        let spec_endpoints: BTreeSet<(String, String)> = if spec_present {
-            let yaml = fs::read_to_string(&spec_path)
-                .with_context(|| format!("reading {}", spec_path.display()))?;
-            match parse_spec_endpoints(&yaml) {
-                Ok(eps) => eps.into_iter().collect(),
-                Err(e) => {
-                    report
-                        .warnings
-                        .push(format!("{}: {}", spec_path.display(), e));
-                    BTreeSet::new()
-                }
-            }
-        } else {
-            BTreeSet::new()
-        };
+    for (slug, ctrls_by_type) in &by_slug {
+        let layout = domain_layout::detect_layout(domains_root, slug);
 
-        let mut controller_endpoints: BTreeMap<(String, String), (String, String)> =
-            BTreeMap::new();
-        for c in controllers {
-            for m in &c.methods {
-                if let (Some(http), Some(path)) = (&m.http_method, &m.path) {
-                    let key = (http.to_uppercase(), normalize_path(path));
-                    controller_endpoints.insert(key, (c.class.clone(), m.name.clone()));
-                }
-            }
+        // Decide which API types to check: union of (controller types observed)
+        // and (types present in the on-disk layout). Empty union (no
+        // controllers, no specs, just a stale dir) → check WebApi as a default
+        // probe so we still report `spec_yaml_present: false`.
+        let mut types_to_check: BTreeSet<ApiType> = ctrls_by_type.keys().copied().collect();
+        if let DetectedLayout::MultiType(types) = &layout {
+            types_to_check.extend(types.iter().copied());
         }
-        let controller_set: BTreeSet<(String, String)> =
-            controller_endpoints.keys().cloned().collect();
+        if types_to_check.is_empty() {
+            types_to_check.insert(ApiType::WebApi);
+        }
+        let multi_type = matches!(&layout, DetectedLayout::MultiType(_));
 
-        let normalized_spec: BTreeSet<(String, String)> = spec_endpoints
-            .into_iter()
-            .map(|(h, p)| (h, normalize_path(&p)))
-            .collect();
+        let mut spec_yaml_present_by_type: BTreeMap<ApiType, bool> = BTreeMap::new();
+        let mut all_controllers_without_spec: Vec<EndpointWithSource> = Vec::new();
+        let mut all_spec_without_controllers: Vec<EndpointEntry> = Vec::new();
+        let mut total_matched = 0usize;
 
-        let matched: usize = controller_set.intersection(&normalized_spec).count();
+        for api_type in types_to_check {
+            let spec_path = if multi_type {
+                domains_root
+                    .join(slug)
+                    .join(api_type.dir_name())
+                    .join("api-spec.yaml")
+            } else {
+                domains_root.join(slug).join("api-spec.yaml")
+            };
+            let spec_present = spec_path.exists();
+            spec_yaml_present_by_type.insert(api_type, spec_present);
 
-        let controllers_without_spec: Vec<EndpointWithSource> = controller_set
-            .difference(&normalized_spec)
-            .map(|k| {
-                let (cls, mname) = controller_endpoints
-                    .get(k)
-                    .cloned()
-                    .unwrap_or_default();
-                EndpointWithSource {
+            let spec_endpoints: BTreeSet<(String, String)> = if spec_present {
+                let yaml = fs::read_to_string(&spec_path)
+                    .with_context(|| format!("reading {}", spec_path.display()))?;
+                match parse_spec_endpoints(&yaml) {
+                    Ok(eps) => eps
+                        .into_iter()
+                        .map(|(h, p)| (h, normalize_path(&p)))
+                        .collect(),
+                    Err(e) => {
+                        report
+                            .warnings
+                            .push(format!("{}: {}", spec_path.display(), e));
+                        BTreeSet::new()
+                    }
+                }
+            } else {
+                BTreeSet::new()
+            };
+
+            let empty: Vec<&Controller> = Vec::new();
+            let ctrls = ctrls_by_type.get(&api_type).unwrap_or(&empty);
+
+            let mut controller_endpoints: BTreeMap<(String, String), (String, String)> =
+                BTreeMap::new();
+            for c in ctrls {
+                for m in &c.methods {
+                    if let (Some(http), Some(path)) = (&m.http_method, &m.path) {
+                        let key = (http.to_uppercase(), normalize_path(path));
+                        controller_endpoints.insert(key, (c.class.clone(), m.name.clone()));
+                    }
+                }
+            }
+            let controller_set: BTreeSet<(String, String)> =
+                controller_endpoints.keys().cloned().collect();
+
+            total_matched += controller_set.intersection(&spec_endpoints).count();
+
+            for k in controller_set.difference(&spec_endpoints) {
+                let (cls, mname) = controller_endpoints.get(k).cloned().unwrap_or_default();
+                all_controllers_without_spec.push(EndpointWithSource {
                     http: k.0.clone(),
                     path: k.1.clone(),
+                    api_type,
                     controller: cls,
                     method: mname,
-                }
-            })
-            .collect();
+                });
+            }
+            for k in spec_endpoints.difference(&controller_set) {
+                all_spec_without_controllers.push(EndpointEntry {
+                    http: k.0.clone(),
+                    path: k.1.clone(),
+                    api_type,
+                });
+            }
+        }
 
-        let spec_without_controllers: Vec<EndpointEntry> = normalized_spec
-            .difference(&controller_set)
-            .map(|k| EndpointEntry {
-                http: k.0.clone(),
-                path: k.1.clone(),
-            })
-            .collect();
-
+        let any_spec_present = spec_yaml_present_by_type.values().any(|p| *p);
         report.domains.push(DomainDrift {
             name: slug.clone(),
-            matched,
-            controllers_without_spec,
-            spec_without_controllers,
-            spec_yaml_present: spec_present,
+            multi_type,
+            matched: total_matched,
+            controllers_without_spec: all_controllers_without_spec,
+            spec_without_controllers: all_spec_without_controllers,
+            spec_yaml_present: any_spec_present,
+            spec_yaml_present_by_type,
         });
     }
 
