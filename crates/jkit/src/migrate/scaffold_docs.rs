@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use serde::Serialize;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -23,6 +23,19 @@ struct DomainReport {
     method_count: usize,
 }
 
+#[derive(Deserialize)]
+struct DomainMap {
+    #[allow(dead_code)]
+    schema_version: Option<u32>,
+    domains: Vec<DomainMapping>,
+}
+
+#[derive(Deserialize)]
+struct DomainMapping {
+    slug: String,
+    controllers: Vec<String>,
+}
+
 const FILES: &[&str] = &[
     "api-spec.yaml",
     "domain-model.md",
@@ -30,18 +43,37 @@ const FILES: &[&str] = &[
     "test-scenarios.yaml",
 ];
 
-pub fn run(src_root: &Path, pom: &Path, out_dir: &Path) -> Result<()> {
+pub fn run(
+    src_root: &Path,
+    pom: &Path,
+    out_dir: &Path,
+    domain_map_path: Option<&Path>,
+) -> Result<()> {
     let meta = service_meta::compute(pom, src_root)
         .context("scanning controllers via service_meta::compute")?;
 
+    let mut warnings = meta.warnings.clone();
+
+    // Resolve controller-class → slug mapping.
+    let class_to_slug: HashMap<String, String> = if let Some(p) = domain_map_path {
+        load_domain_map(p, &meta.controllers, &mut warnings)?
+    } else {
+        meta.controllers
+            .iter()
+            .map(|c| (c.class.clone(), c.domain_slug.clone()))
+            .collect()
+    };
+
     let mut by_slug: BTreeMap<String, Vec<&Controller>> = BTreeMap::new();
     for c in &meta.controllers {
-        by_slug.entry(c.domain_slug.clone()).or_default().push(c);
+        if let Some(slug) = class_to_slug.get(&c.class) {
+            by_slug.entry(slug.clone()).or_default().push(c);
+        }
     }
 
     let mut report = ScaffoldReport {
         domains: Vec::new(),
-        warnings: meta.warnings.clone(),
+        warnings,
     };
 
     for (slug, controllers) in &by_slug {
@@ -223,6 +255,55 @@ fn render_scenarios(slug: &str, controllers: &[&Controller]) -> String {
         s.push_str("  []\n");
     }
     s
+}
+
+fn load_domain_map(
+    path: &Path,
+    detected: &[Controller],
+    warnings: &mut Vec<String>,
+) -> Result<HashMap<String, String>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let parsed: DomainMap = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {} as domain-map JSON", path.display()))?;
+
+    let mut class_to_slug: HashMap<String, String> = HashMap::new();
+    for d in &parsed.domains {
+        for c in &d.controllers {
+            if let Some(prev) = class_to_slug.insert(c.clone(), d.slug.clone()) {
+                if prev != d.slug {
+                    warnings.push(format!(
+                        "domain map: controller {c} listed in both '{prev}' and '{}'",
+                        d.slug
+                    ));
+                }
+            }
+        }
+    }
+
+    let detected_classes: std::collections::HashSet<String> =
+        detected.iter().map(|c| c.class.clone()).collect();
+    let mapped_classes: std::collections::HashSet<String> =
+        class_to_slug.keys().cloned().collect();
+
+    let missing: Vec<&String> = detected_classes.difference(&mapped_classes).collect();
+    let stale: Vec<&String> = mapped_classes.difference(&detected_classes).collect();
+
+    for m in &missing {
+        warnings.push(format!(
+            "domain map: controller {m} not listed; falling back to derive_domain_slug"
+        ));
+        if let Some(c) = detected.iter().find(|c| &c.class == *m) {
+            class_to_slug.insert(c.class.clone(), c.domain_slug.clone());
+        }
+    }
+    for s in &stale {
+        warnings.push(format!(
+            "domain map: controller {s} listed but not detected in source — ignored"
+        ));
+    }
+
+    Ok(class_to_slug)
 }
 
 fn extract_path_params(path: &str) -> Vec<String> {
