@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::domain_layout::{self, ApiType};
 use crate::util::print_json;
 
 #[derive(Serialize)]
@@ -37,6 +38,11 @@ pub struct Controller {
     pub class: String,
     pub file: String,
     pub domain_slug: String,
+    /// Classified from the source file path via `domain_layout::classify_path`
+    /// using the project's `docs/api-type-mapping.yaml` overrides (or Spring
+    /// defaults when absent). Defaults to `WebApi` when no path component
+    /// matches; a warning is emitted on `ServiceMeta.warnings` in that case.
+    pub api_type: ApiType,
     pub methods: Vec<MethodMeta>,
 }
 
@@ -79,11 +85,32 @@ pub fn compute(pom_path: &Path, src_root: &Path) -> Result<ServiceMeta> {
     let (service_name, service_name_source, mut warnings) =
         resolve_service_name(&coords);
 
-    let controllers = if src_root.exists() {
+    let mut controllers = if src_root.exists() {
         scan_controllers(src_root)?
     } else {
         Vec::new()
     };
+
+    // Classify each controller's API type from its file path. The project's
+    // mapping lives at `<project>/docs/api-type-mapping.yaml`; the project root
+    // is taken as `pom_path.parent()` (or cwd when pom is at the workspace
+    // root). Mapping load failures degrade silently to defaults — never block
+    // service-meta on a malformed config file.
+    let project_root = pom_path.parent().unwrap_or(Path::new("."));
+    let api_type_mapping =
+        domain_layout::load_mapping_from_project(project_root).unwrap_or_default();
+    for c in &mut controllers {
+        match domain_layout::classify_path(Path::new(&c.file), &api_type_mapping) {
+            Some(ty) => c.api_type = ty,
+            None => {
+                warnings.push(format!(
+                    "controller {} at {} has no recognizable API-type directory in its path; defaulting to web-api",
+                    c.class, c.file
+                ));
+                // c.api_type already defaults to WebApi from scan_controllers
+            }
+        }
+    }
 
     // Collisions on domain slug -> warn.
     let mut by_slug: HashMap<String, usize> = HashMap::new();
@@ -414,6 +441,9 @@ fn scan_controllers(src_root: &Path) -> Result<Vec<Controller>> {
                 class: fqcn,
                 file: entry.path().to_string_lossy().into_owned(),
                 domain_slug,
+                // Initial placeholder — `compute()` reclassifies with the
+                // project's loaded mapping after scan_controllers returns.
+                api_type: ApiType::WebApi,
                 methods,
             });
         }

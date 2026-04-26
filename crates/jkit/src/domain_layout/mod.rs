@@ -27,7 +27,10 @@
 //! docs/domains/<slug>/conflicts.md          (still shared)
 //! ```
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -148,6 +151,82 @@ pub enum DetectedLayout {
     MultiType(Vec<ApiType>),
 }
 
+/// Classification rule: which directory-name aliases point at which API type.
+/// Optionally loaded from `<project>/docs/api-type-mapping.yaml`; otherwise
+/// uses the Spring Boot defaults (`controller/`, `api/`, `openapi/`).
+#[derive(Debug, Clone)]
+pub struct ApiTypeMapping {
+    pub web_api: Vec<String>,
+    pub microservice_api: Vec<String>,
+    pub open_api: Vec<String>,
+}
+
+impl Default for ApiTypeMapping {
+    fn default() -> Self {
+        Self {
+            web_api: vec!["controller".to_string()],
+            microservice_api: vec!["api".to_string()],
+            open_api: vec!["openapi".to_string()],
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ApiTypeMappingFile {
+    api_types: HashMap<String, Vec<String>>,
+}
+
+/// Load the project's API-type mapping from
+/// `<project_root>/docs/api-type-mapping.yaml`. Falls back to the Spring Boot
+/// default mapping when the file is absent. Per-type entries in the file
+/// fully override the defaults for that type only — unspecified types keep
+/// their default aliases.
+pub fn load_mapping_from_project(project_root: &Path) -> Result<ApiTypeMapping> {
+    let path = project_root.join("docs").join("api-type-mapping.yaml");
+    if !path.exists() {
+        return Ok(ApiTypeMapping::default());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let parsed: ApiTypeMappingFile = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parsing {} as api-type-mapping YAML", path.display()))?;
+    let mut mapping = ApiTypeMapping::default();
+    if let Some(v) = parsed.api_types.get("web-api") {
+        mapping.web_api = v.clone();
+    }
+    if let Some(v) = parsed.api_types.get("microservice-api") {
+        mapping.microservice_api = v.clone();
+    }
+    if let Some(v) = parsed.api_types.get("open-api") {
+        mapping.open_api = v.clone();
+    }
+    Ok(mapping)
+}
+
+/// Classify a controller's source-file path to an API type by scanning its
+/// path components left-to-right (most-enclosing first). The first component
+/// that matches any alias in `mapping` wins. Returns `None` when no component
+/// matches — the caller decides whether to default or warn.
+pub fn classify_path(file_path: &Path, mapping: &ApiTypeMapping) -> Option<ApiType> {
+    for component in file_path.components() {
+        if let std::path::Component::Normal(s) = component {
+            let Some(s) = s.to_str() else {
+                continue;
+            };
+            if mapping.web_api.iter().any(|d| d == s) {
+                return Some(ApiType::WebApi);
+            }
+            if mapping.microservice_api.iter().any(|d| d == s) {
+                return Some(ApiType::MicroserviceApi);
+            }
+            if mapping.open_api.iter().any(|d| d == s) {
+                return Some(ApiType::OpenApi);
+            }
+        }
+    }
+    None
+}
+
 pub fn detect_layout(domains_root: &Path, slug: &str) -> DetectedLayout {
     let root = domains_root.join(slug);
     if !root.exists() {
@@ -265,6 +344,94 @@ mod tests {
             assert_eq!(ApiType::from_dir_name(ty.dir_name()), Some(*ty));
         }
         assert_eq!(ApiType::from_dir_name("nonsense"), None);
+    }
+
+    #[test]
+    fn classify_default_mapping_recognizes_spring_dirs() {
+        let m = ApiTypeMapping::default();
+        assert_eq!(
+            classify_path(
+                Path::new("src/main/java/com/example/controller/Foo.java"),
+                &m,
+            ),
+            Some(ApiType::WebApi)
+        );
+        assert_eq!(
+            classify_path(
+                Path::new("src/main/java/com/example/api/v1/Foo.java"),
+                &m,
+            ),
+            Some(ApiType::MicroserviceApi)
+        );
+        assert_eq!(
+            classify_path(
+                Path::new("src/main/java/com/example/openapi/Foo.java"),
+                &m,
+            ),
+            Some(ApiType::OpenApi)
+        );
+        assert_eq!(
+            classify_path(
+                Path::new("src/main/java/com/example/util/Foo.java"),
+                &m,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_first_match_wins() {
+        // `api/` enclosing `controller/` -> api wins (most-enclosing first).
+        let m = ApiTypeMapping::default();
+        assert_eq!(
+            classify_path(
+                Path::new("src/main/java/com/foo/api/controller/X.java"),
+                &m,
+            ),
+            Some(ApiType::MicroserviceApi)
+        );
+    }
+
+    #[test]
+    fn load_mapping_uses_defaults_when_file_absent() {
+        let dir = TempDir::new().unwrap();
+        let m = load_mapping_from_project(dir.path()).unwrap();
+        assert_eq!(m.web_api, vec!["controller".to_string()]);
+        assert_eq!(m.microservice_api, vec!["api".to_string()]);
+        assert_eq!(m.open_api, vec!["openapi".to_string()]);
+    }
+
+    #[test]
+    fn load_mapping_overrides_per_type() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("docs")).unwrap();
+        fs::write(
+            dir.path().join("docs/api-type-mapping.yaml"),
+            r#"
+api_types:
+  web-api: [controller, web]
+  open-api: [openapi, external, public]
+"#,
+        )
+        .unwrap();
+        let m = load_mapping_from_project(dir.path()).unwrap();
+        assert_eq!(m.web_api, vec!["controller".to_string(), "web".to_string()]);
+        // unspecified type keeps default
+        assert_eq!(m.microservice_api, vec!["api".to_string()]);
+        assert_eq!(
+            m.open_api,
+            vec!["openapi".to_string(), "external".to_string(), "public".to_string()]
+        );
+    }
+
+    #[test]
+    fn classify_with_custom_alias() {
+        let mut m = ApiTypeMapping::default();
+        m.web_api.push("web".to_string());
+        assert_eq!(
+            classify_path(Path::new("src/main/java/com/foo/web/Foo.java"), &m),
+            Some(ApiType::WebApi)
+        );
     }
 
     #[test]
