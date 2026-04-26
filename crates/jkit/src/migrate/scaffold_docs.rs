@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::contract::service_meta::{self, Controller, MethodMeta};
+use crate::migrate::smartdoc;
 use crate::util::{atomic_write, print_json};
 
 #[derive(Serialize)]
@@ -19,8 +20,10 @@ struct DomainReport {
     dir: String,
     files_created: Vec<String>,
     files_existing: Vec<String>,
+    files_overwritten: Vec<String>,
     controllers: Vec<String>,
     method_count: usize,
+    api_spec_source: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -48,13 +51,13 @@ pub fn run(
     pom: &Path,
     out_dir: &Path,
     domain_map_path: Option<&Path>,
+    use_smartdoc: bool,
 ) -> Result<()> {
     let meta = service_meta::compute(pom, src_root)
         .context("scanning controllers via service_meta::compute")?;
 
     let mut warnings = meta.warnings.clone();
 
-    // Resolve controller-class → slug mapping.
     let class_to_slug: HashMap<String, String> = if let Some(p) = domain_map_path {
         load_domain_map(p, &meta.controllers, &mut warnings)?
     } else {
@@ -71,6 +74,31 @@ pub fn run(
         }
     }
 
+    // When --use-smartdoc, run smartdoc once across the whole project and slice
+    // its output per domain; per-domain api-spec.yaml comes from the slice when
+    // the slice has at least one operation, else falls back to regex render.
+    let smartdoc_yaml: BTreeMap<String, String> = if use_smartdoc {
+        match smartdoc::slice_per_domain(pom, &meta, &class_to_slug) {
+            Ok(result) => {
+                warnings.extend(result.warnings);
+                if result.matched_operations == 0 && result.unmatched_operations == 0 {
+                    warnings.push(
+                        "smart-doc produced no recognizable operations; falling back to regex output for all domains".to_string(),
+                    );
+                }
+                result.per_domain_yaml
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "smart-doc failed; falling back to regex output for all domains: {e}"
+                ));
+                BTreeMap::new()
+            }
+        }
+    } else {
+        BTreeMap::new()
+    };
+
     let mut report = ScaffoldReport {
         domains: Vec::new(),
         warnings,
@@ -83,9 +111,30 @@ pub fn run(
 
         let mut created = Vec::new();
         let mut existing = Vec::new();
+        let mut overwritten = Vec::new();
+        let mut api_spec_source = "regex";
 
         for fname in FILES {
             let path = dir.join(fname);
+
+            // api-spec.yaml is the only file that smartdoc overwrites — its
+            // output is authoritative when present. The other three stay
+            // skip-if-exists so hand-edits aren't blown away on re-runs.
+            if *fname == "api-spec.yaml" {
+                if let Some(yaml) = smartdoc_yaml.get(slug) {
+                    let was_existing = path.exists();
+                    atomic_write(&path, yaml.as_bytes())
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    if was_existing {
+                        overwritten.push((*fname).to_string());
+                    } else {
+                        created.push((*fname).to_string());
+                    }
+                    api_spec_source = "smartdoc";
+                    continue;
+                }
+            }
+
             if path.exists() {
                 existing.push((*fname).to_string());
                 continue;
@@ -108,8 +157,10 @@ pub fn run(
             dir: dir.display().to_string(),
             files_created: created,
             files_existing: existing,
+            files_overwritten: overwritten,
             controllers: controllers.iter().map(|c| c.class.clone()).collect(),
             method_count,
+            api_spec_source,
         });
     }
 

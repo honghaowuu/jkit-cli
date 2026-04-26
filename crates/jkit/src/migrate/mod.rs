@@ -1,5 +1,6 @@
 pub mod infer_domains;
 pub mod scaffold_docs;
+pub mod smartdoc;
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -22,6 +23,10 @@ pub enum MigrateCmd {
     /// already-present files in the JSON output. Controllers are grouped by the
     /// resolved domain map (`--domain-map`) when provided; otherwise falls back
     /// to the same `derive_domain_slug` rule the contract pipeline uses.
+    /// With `--use-smartdoc`, runs smart-doc:openapi and slices the resulting
+    /// OpenAPI doc per domain — produces authoritative request/response schemas
+    /// from DTOs instead of regex-derived skeletons. Falls back to regex output
+    /// for any domain smartdoc fails to cover.
     ScaffoldDocs {
         #[arg(long, default_value = "src/main/java")]
         src: PathBuf,
@@ -34,6 +39,11 @@ pub enum MigrateCmd {
         /// instead of `derive_domain_slug`.
         #[arg(long)]
         domain_map: Option<PathBuf>,
+        /// Run smart-doc:openapi to produce authoritative api-spec.yaml per
+        /// domain (request/response schemas from DTOs). Requires Maven and a
+        /// working build. Falls back to regex output if smartdoc fails.
+        #[arg(long)]
+        use_smartdoc: bool,
     },
 }
 
@@ -45,6 +55,7 @@ pub fn run(cmd: MigrateCmd) -> Result<()> {
             pom,
             out,
             domain_map,
-        } => scaffold_docs::run(&src, &pom, &out, domain_map.as_deref()),
+            use_smartdoc,
+        } => scaffold_docs::run(&src, &pom, &out, domain_map.as_deref(), use_smartdoc),
     }
 }
