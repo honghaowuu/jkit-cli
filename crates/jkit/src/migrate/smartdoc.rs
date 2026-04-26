@@ -30,6 +30,62 @@ pub fn slice_per_domain(
     meta: &ServiceMeta,
     class_to_slug: &HashMap<String, String>,
 ) -> Result<SmartdocResult> {
+    // Snapshot the pristine project files BEFORE any mutation so the smart-doc
+    // plugin install + smart-doc.json write can be undone after we've extracted
+    // openapi.json. Migration is a one-shot read of existing reality; leaving
+    // the project's pom.xml mutated would surprise users.
+    let pom_original = fs::read_to_string(pom)
+        .with_context(|| format!("reading {} for restore snapshot", pom.display()))?;
+    let sd_path = Path::new("smart-doc.json");
+    let smartdoc_original: Option<String> = if sd_path.exists() {
+        Some(fs::read_to_string(sd_path).with_context(|| {
+            format!("reading {} for restore snapshot", sd_path.display())
+        })?)
+    } else {
+        None
+    };
+
+    let result = slice_per_domain_inner(pom, sd_path, meta, class_to_slug);
+
+    restore_originals(pom, &pom_original, sd_path, smartdoc_original.as_deref());
+
+    result
+}
+
+fn restore_originals(
+    pom: &Path,
+    pom_original: &str,
+    sd_path: &Path,
+    smartdoc_original: Option<&str>,
+) {
+    if let Err(e) = atomic_write(pom, pom_original.as_bytes()) {
+        eprintln!(
+            "warning: failed to restore {} after smart-doc run: {e}",
+            pom.display()
+        );
+    }
+    match smartdoc_original {
+        Some(content) => {
+            if let Err(e) = atomic_write(sd_path, content.as_bytes()) {
+                eprintln!(
+                    "warning: failed to restore {} after smart-doc run: {e}",
+                    sd_path.display()
+                );
+            }
+        }
+        None => {
+            // smart-doc.json didn't exist before; remove the one we wrote.
+            let _ = fs::remove_file(sd_path);
+        }
+    }
+}
+
+fn slice_per_domain_inner(
+    pom: &Path,
+    sd_path: &Path,
+    meta: &ServiceMeta,
+    class_to_slug: &HashMap<String, String>,
+) -> Result<SmartdocResult> {
     let mut warnings = Vec::new();
 
     pom_prereqs::compute(ProfileArg::SmartDoc, true, pom)
@@ -39,7 +95,6 @@ pub fn slice_per_domain(
     fs::create_dir_all(out_dir)
         .with_context(|| format!("creating {}", out_dir.display()))?;
     let openapi_json_path = out_dir.join("openapi.json");
-    let sd_path = Path::new("smart-doc.json");
     write_smart_doc_json(sd_path, &openapi_json_path)?;
 
     let output = Command::new("mvn")
