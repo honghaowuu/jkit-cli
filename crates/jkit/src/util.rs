@@ -29,9 +29,15 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Print a value as compact JSON to stdout with a trailing newline.
+/// Print `value` as a Phase A success envelope (`{"ok": true, ...fields}`) to
+/// stdout, then exit 0. Diverges; the declared `Result<()>` return type lets
+/// existing tail-position call sites (`return print_json(&x);`, `print_json(&x)?;`)
+/// compile unchanged.
+///
+/// `value` MUST serialize to a JSON object so its fields can be flattened
+/// alongside the envelope marker. Top-level arrays should be wrapped at the
+/// call site (e.g. `print_json(&json!({"items": vec}))`) before being passed in.
 pub fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
-    let s = serde_json::to_string(value).context("serializing JSON")?;
-    println!("{}", s);
-    Ok(())
+    let v = serde_json::to_value(value).context("serializing JSON")?;
+    crate::envelope::print_ok(v)
 }

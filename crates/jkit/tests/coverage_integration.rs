@@ -104,7 +104,8 @@ fn cli_top_k_limits_output() {
         .expect("run jkit coverage");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
-    assert_eq!(v.as_array().unwrap().len(), 2);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["methods"].as_array().unwrap().len(), 2);
 }
 
 #[test]

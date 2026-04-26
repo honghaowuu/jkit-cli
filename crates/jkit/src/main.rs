@@ -60,12 +60,6 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("error: {}", e);
-            for cause in e.chain().skip(1) {
-                eprintln!("  caused by: {}", cause);
-            }
-            ExitCode::from(1)
-        }
+        Err(e) => jkit::envelope::print_err(&format!("{e:#}"), None),
     }
 }

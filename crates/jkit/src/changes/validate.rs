@@ -7,7 +7,7 @@ use crate::util::print_json;
 
 #[derive(Serialize, Debug)]
 pub struct Output {
-    ok: bool,
+    valid: bool,
     files: Vec<FileResult>,
 }
 
@@ -40,7 +40,7 @@ pub fn compute(cwd: &Path, files: &[PathBuf]) -> Output {
         results.push(res);
     }
     Output {
-        ok: all_ok && !files.is_empty(),
+        valid: all_ok && !files.is_empty(),
         files: results,
     }
 }
@@ -153,7 +153,7 @@ mod tests {
             tmp.path(),
             &[PathBuf::from("docs/changes/pending/x.md")],
         );
-        assert!(out.ok, "{:?}", out);
+        assert!(out.valid, "{:?}", out);
     }
 
     #[test]
@@ -168,7 +168,7 @@ mod tests {
             tmp.path(),
             &[PathBuf::from("docs/changes/pending/x.md")],
         );
-        assert!(!out.ok);
+        assert!(!out.valid);
         assert!(out.files[0].errors.iter().any(|e| e.contains("body is empty")));
     }
 
@@ -183,7 +183,7 @@ mod tests {
             tmp.path(),
             &[PathBuf::from("docs/changes/pending/x.md")],
         );
-        assert!(!out.ok);
+        assert!(!out.valid);
         assert!(out.files[0]
             .errors
             .iter()
@@ -202,14 +202,14 @@ mod tests {
             tmp.path(),
             &[PathBuf::from("docs/changes/pending/x.md")],
         );
-        assert!(out.ok, "{:?}", out);
+        assert!(out.valid, "{:?}", out);
     }
 
     #[test]
     fn no_files_means_not_ok() {
         let tmp = tempdir().unwrap();
         let out = compute(tmp.path(), &[]);
-        assert!(!out.ok);
+        assert!(!out.valid);
         assert!(out.files.is_empty());
     }
 
@@ -220,7 +220,7 @@ mod tests {
             tmp.path(),
             &[PathBuf::from("docs/changes/pending/missing.md")],
         );
-        assert!(!out.ok);
+        assert!(!out.valid);
         assert!(out.files[0].errors[0].contains("read failed"));
     }
 

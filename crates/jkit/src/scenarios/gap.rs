@@ -72,9 +72,9 @@ pub fn run(
 fn run_single(domain: &str, test_root: &Path) -> Result<()> {
     let yaml_path = PathBuf::from("docs/domains").join(domain).join("test-scenarios.yaml");
     if !yaml_path.exists() {
-        // Per PRD: missing → output [], exit 0.
-        println!("[]");
-        return Ok(());
+        // Per PRD: missing → empty gaps list, exit 0.
+        let empty: Vec<GapEntrySingle> = Vec::new();
+        return print_json(&serde_json::json!({ "gaps": empty }));
     }
     let groups = load_scenarios(&yaml_path)?;
     let implemented = implemented_method_names(test_root)?;
@@ -92,7 +92,7 @@ fn run_single(domain: &str, test_root: &Path) -> Result<()> {
             }
         }
     }
-    print_json(&out)
+    print_json(&serde_json::json!({ "gaps": out }))
 }
 
 fn run_aggregated(run_dir: &Path, test_root: &Path, pom_path: &Path) -> Result<()> {
@@ -153,7 +153,7 @@ fn run_aggregated(run_dir: &Path, test_root: &Path, pom_path: &Path) -> Result<(
             }
         }
     }
-    print_json(&out)
+    print_json(&serde_json::json!({ "gaps": out }))
 }
 
 fn load_scenarios(path: &Path) -> Result<Vec<EndpointGroup>> {
