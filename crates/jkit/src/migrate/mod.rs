@@ -1,4 +1,6 @@
+pub mod call_graph;
 pub mod infer_domains;
+pub mod parse;
 pub mod scaffold_docs;
 pub mod smartdoc;
 
@@ -23,10 +25,14 @@ pub enum MigrateCmd {
     /// already-present files in the JSON output. Controllers are grouped by the
     /// resolved domain map (`--domain-map`) when provided; otherwise falls back
     /// to the same `derive_domain_slug` rule the contract pipeline uses.
-    /// With `--use-smartdoc`, runs smart-doc:openapi and slices the resulting
-    /// OpenAPI doc per domain — produces authoritative request/response schemas
-    /// from DTOs instead of regex-derived skeletons. Falls back to regex output
-    /// for any domain smartdoc fails to cover.
+    ///
+    /// Optional content-quality flags:
+    /// - `--use-smartdoc`: smart-doc:openapi for authoritative api-spec.yaml
+    /// - `--use-call-graph`: tree-sitter-java for controller→service call-graph
+    ///   skeleton in api-implement-logic.md (rules stay TODO; structure
+    ///   comes from code).
+    /// Each flag falls back to regex/skeleton output independently if its
+    /// underlying tool fails.
     ScaffoldDocs {
         #[arg(long, default_value = "src/main/java")]
         src: PathBuf,
@@ -44,6 +50,11 @@ pub enum MigrateCmd {
         /// working build. Falls back to regex output if smartdoc fails.
         #[arg(long)]
         use_smartdoc: bool,
+        /// Build a controller→service call graph via tree-sitter-java and
+        /// render it into api-implement-logic.md (rules stay TODO; structure
+        /// comes from code, 2 levels deep, simple-name resolution).
+        #[arg(long)]
+        use_call_graph: bool,
     },
 }
 
@@ -56,6 +67,14 @@ pub fn run(cmd: MigrateCmd) -> Result<()> {
             out,
             domain_map,
             use_smartdoc,
-        } => scaffold_docs::run(&src, &pom, &out, domain_map.as_deref(), use_smartdoc),
+            use_call_graph,
+        } => scaffold_docs::run(
+            &src,
+            &pom,
+            &out,
+            domain_map.as_deref(),
+            use_smartdoc,
+            use_call_graph,
+        ),
     }
 }

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::contract::service_meta::{self, Controller, MethodMeta};
-use crate::migrate::smartdoc;
+use crate::migrate::{call_graph, smartdoc};
 use crate::util::{atomic_write, print_json};
 
 #[derive(Serialize)]
@@ -24,6 +24,7 @@ struct DomainReport {
     controllers: Vec<String>,
     method_count: usize,
     api_spec_source: &'static str,
+    impl_logic_source: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +53,7 @@ pub fn run(
     out_dir: &Path,
     domain_map_path: Option<&Path>,
     use_smartdoc: bool,
+    use_call_graph: bool,
 ) -> Result<()> {
     let meta = service_meta::compute(pom, src_root)
         .context("scanning controllers via service_meta::compute")?;
@@ -99,6 +101,29 @@ pub fn run(
         BTreeMap::new()
     };
 
+    // When --use-call-graph, build the controller→service call graph once
+    // across all controllers. Per-domain rendering pulls from the slug index.
+    let call_graph_by_slug = if use_call_graph {
+        match call_graph::build(src_root, &meta.controllers, &class_to_slug) {
+            Ok(map) => {
+                if map.is_empty() {
+                    warnings.push(
+                        "call-graph: no controllers parsed via tree-sitter; falling back to skeleton impl-logic for all domains".to_string(),
+                    );
+                }
+                map
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "call-graph: tree-sitter parse failed; falling back to skeleton impl-logic for all domains: {e}"
+                ));
+                std::collections::HashMap::new()
+            }
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut report = ScaffoldReport {
         domains: Vec::new(),
         warnings,
@@ -113,13 +138,15 @@ pub fn run(
         let mut existing = Vec::new();
         let mut overwritten = Vec::new();
         let mut api_spec_source = "regex";
+        let mut impl_logic_source = "regex";
 
         for fname in FILES {
             let path = dir.join(fname);
 
-            // api-spec.yaml is the only file that smartdoc overwrites — its
-            // output is authoritative when present. The other three stay
-            // skip-if-exists so hand-edits aren't blown away on re-runs.
+            // Two files have content-quality flags that overwrite when their
+            // source is available: api-spec.yaml (smartdoc) and
+            // api-implement-logic.md (call-graph). The other two stay
+            // skip-if-exists so hand-edits survive re-runs.
             if *fname == "api-spec.yaml" {
                 if let Some(yaml) = smartdoc_yaml.get(slug) {
                     let was_existing = path.exists();
@@ -131,6 +158,22 @@ pub fn run(
                         created.push((*fname).to_string());
                     }
                     api_spec_source = "smartdoc";
+                    continue;
+                }
+            }
+
+            if *fname == "api-implement-logic.md" {
+                if let Some(entries) = call_graph_by_slug.get(slug) {
+                    let body = call_graph::render(slug, entries);
+                    let was_existing = path.exists();
+                    atomic_write(&path, body.as_bytes())
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    if was_existing {
+                        overwritten.push((*fname).to_string());
+                    } else {
+                        created.push((*fname).to_string());
+                    }
+                    impl_logic_source = "call-graph";
                     continue;
                 }
             }
@@ -161,6 +204,7 @@ pub fn run(
             controllers: controllers.iter().map(|c| c.class.clone()).collect(),
             method_count,
             api_spec_source,
+            impl_logic_source,
         });
     }
 
