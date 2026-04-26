@@ -1,5 +1,6 @@
 pub mod service_meta;
 pub mod stage;
+pub mod stage_status;
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -32,6 +33,15 @@ pub enum ContractCmd {
         #[arg(long, default_value = "src/main/java/")]
         src: PathBuf,
     },
+    /// Read-only: report whether `.jkit/contract-stage/<service>/` has been
+    /// hand-edited since the last successful `stage`. Compares current
+    /// SHA256s of every file in `.manifest.json` to the recorded hashes.
+    /// Used by the publish-contract skill to escalate the overwrite gate
+    /// when a re-stage would clobber local edits.
+    StageStatus {
+        #[arg(long)]
+        service: String,
+    },
 }
 
 pub fn run(cmd: ContractCmd) -> Result<()> {
@@ -53,5 +63,6 @@ pub fn run(cmd: ContractCmd) -> Result<()> {
                 .collect();
             stage::run(&service, &interview, &domains, dry_run, force, &pom, &src)
         }
+        ContractCmd::StageStatus { service } => stage_status::run(&service),
     }
 }

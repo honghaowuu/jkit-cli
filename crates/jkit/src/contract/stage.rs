@@ -7,6 +7,7 @@ use std::process::Command;
 use tera::{Context as TeraContext, Tera};
 
 use super::service_meta;
+use super::stage_status;
 use crate::pom::prereqs::{self as pom_prereqs, PomReport};
 use crate::pom::ProfileArg;
 use crate::util::{atomic_write, print_json};
@@ -292,6 +293,13 @@ pub fn run(
 
     // 9. .gitignore
     let gitignore_updated = ensure_gitignore_entry(".jkit/contract-stage/")?;
+
+    // 10. Write per-file SHA256 manifest so the next `stage-status` call
+    // can detect hand-edits before the human approves another --force run.
+    let manifest = stage_status::build_manifest(&files_written)?;
+    let manifest_path = stage_dir.join(".manifest.json");
+    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+    atomic_write(&manifest_path, &manifest_json)?;
 
     let report = StageReport {
         service: service.to_string(),
