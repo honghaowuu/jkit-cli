@@ -21,6 +21,10 @@ pub struct JavaFile {
 pub struct ClassDecl {
     pub fqn: String,
     pub simple_name: String,
+    /// Class-level annotation simple names (no `@`, no args). For
+    /// `@RestController @RequestMapping("/foo")` you get
+    /// `["RestController", "RequestMapping"]`.
+    pub annotations: Vec<String>,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<MethodDecl>,
 }
@@ -32,6 +36,8 @@ pub struct FieldDecl {
     /// `List<Invoice>`. We don't strip generics — the simple-name resolver
     /// peels them off when needed.
     pub type_text: String,
+    /// Field-level annotation simple names (no `@`, no args).
+    pub annotations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +122,11 @@ fn extract_class(node: Node, src: &[u8], package: Option<&str>) -> Option<ClassD
         _ => simple_name.clone(),
     };
 
+    // Class-level annotations are siblings of the name node under the
+    // class_declaration. tree-sitter-java exposes them as `marker_annotation`
+    // (`@Foo`) or `annotation` (`@Foo(...)`).
+    let annotations = collect_annotations_at(node, src);
+
     let mut fields = Vec::new();
     let mut methods = Vec::new();
     if let Some(body) = node.child_by_field_name("body") {
@@ -138,9 +149,49 @@ fn extract_class(node: Node, src: &[u8], package: Option<&str>) -> Option<ClassD
     Some(ClassDecl {
         fqn,
         simple_name,
+        annotations,
         fields,
         methods,
     })
+}
+
+/// Walk the immediate children of `node` (typically a class_declaration or a
+/// field_declaration's `modifiers` child) and collect annotation simple names.
+fn collect_annotations_at(node: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "marker_annotation" | "annotation" => {
+                if let Some(name) = child
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(n, src))
+                {
+                    out.push(simple_annotation_name(name));
+                }
+            }
+            "modifiers" => {
+                // field_declaration / method_declaration wrap annotations
+                // inside a modifiers node.
+                let mut sub = child.walk();
+                for c in child.children(&mut sub) {
+                    if matches!(c.kind(), "marker_annotation" | "annotation") {
+                        if let Some(name) =
+                            c.child_by_field_name("name").and_then(|n| node_text(n, src))
+                        {
+                            out.push(simple_annotation_name(name));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn simple_annotation_name(name: &str) -> String {
+    name.rsplit('.').next().unwrap_or(name).to_string()
 }
 
 fn extract_fields(node: Node, src: &[u8]) -> Vec<FieldDecl> {
@@ -150,6 +201,7 @@ fn extract_fields(node: Node, src: &[u8]) -> Vec<FieldDecl> {
         .and_then(|n| node_text(n, src))
         .unwrap_or("")
         .to_string();
+    let annotations = collect_annotations_at(node, src);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "variable_declarator" {
@@ -160,6 +212,7 @@ fn extract_fields(node: Node, src: &[u8]) -> Vec<FieldDecl> {
                 out.push(FieldDecl {
                     name: name.to_string(),
                     type_text: type_text.clone(),
+                    annotations: annotations.clone(),
                 });
             }
         }
@@ -375,6 +428,45 @@ public class InvoiceController {
         let idx = build_class_index(&files);
         assert_eq!(idx.get("Unique"), Some(&"c.Unique".to_string()));
         assert!(!idx.contains_key("InvoiceService"));
+    }
+
+    #[test]
+    fn extracts_class_and_field_annotations() {
+        let dir = TempDir::new().unwrap();
+        let path = write_java(
+            dir.path(),
+            "Invoice.java",
+            r#"
+package com.example;
+
+import javax.persistence.*;
+import javax.validation.constraints.*;
+
+@Entity
+@Table(name = "invoices")
+public class Invoice {
+    @Id
+    @GeneratedValue
+    private Long id;
+
+    @NotNull
+    @Column(nullable = false)
+    private String customerId;
+}
+"#,
+        );
+        let f = parse_file(&path).unwrap();
+        let classes = extract_classes(&f);
+        assert_eq!(classes.len(), 1);
+        let c = &classes[0];
+        assert!(c.annotations.contains(&"Entity".to_string()));
+        assert!(c.annotations.contains(&"Table".to_string()));
+        let id = c.fields.iter().find(|f| f.name == "id").unwrap();
+        assert!(id.annotations.contains(&"Id".to_string()));
+        assert!(id.annotations.contains(&"GeneratedValue".to_string()));
+        let cust = c.fields.iter().find(|f| f.name == "customerId").unwrap();
+        assert!(cust.annotations.contains(&"NotNull".to_string()));
+        assert!(cust.annotations.contains(&"Column".to_string()));
     }
 
     #[test]
