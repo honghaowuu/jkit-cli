@@ -19,6 +19,10 @@ enum Top {
         #[command(subcommand)]
         cmd: jkit::scenarios::ScenariosCmd,
     },
+    Drift {
+        #[command(subcommand)]
+        cmd: jkit::drift::DriftCmd,
+    },
     Migrate {
         #[command(subcommand)]
         cmd: jkit::migrate::MigrateCmd,
@@ -53,6 +57,7 @@ fn main() -> ExitCode {
         Top::Pom { cmd } => jkit::pom::run(cmd),
         Top::Coverage(args) => jkit::coverage::run(args),
         Top::Scenarios { cmd } => jkit::scenarios::run(cmd),
+        Top::Drift { cmd } => jkit::drift::run(cmd),
         Top::Migrate { cmd } => jkit::migrate::run(cmd),
         Top::Migration { cmd } => jkit::migration::run(cmd),
         Top::Contract { cmd } => jkit::contract::run(cmd),
