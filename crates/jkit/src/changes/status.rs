@@ -20,6 +20,28 @@ pub struct ExistingRun {
     new_pending_since_run: Vec<String>,
     has_change_summary: bool,
     has_plan: bool,
+    has_unplaced_migration: bool,
+    pipeline_stage: PipelineStage,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineStage {
+    /// `.change-files` written, but `change-summary.md` not yet — spec-delta
+    /// interrupted before / during Step 13.
+    ChangeSummaryPending,
+    /// SQL was generated under `<run>/migration/V*_pending__*.sql` but not
+    /// yet placed into the project's Flyway dir — sql-migration interrupted
+    /// between SQL generation (Step 4) and `migration place` (Step 5).
+    SqlMigrationPending,
+    /// Change-summary present, no unplaced migration, but plan.md not yet —
+    /// spec-delta interrupted between summary approval (Step 13) and plan
+    /// generation (Step 15).
+    PlanPending,
+    /// All upstream artefacts present; java-tdd hasn't completed yet (or is
+    /// in progress). We don't introspect commits here — that's `kit
+    /// plan-status`'s job.
+    ImplPending,
 }
 
 const REC_NO_PENDING: &str = "no_pending";
@@ -111,6 +133,8 @@ fn latest_run(cwd: &Path, pending: &[String]) -> Result<Option<ExistingRun>> {
         .collect();
     let has_change_summary = latest.join("change-summary.md").is_file();
     let has_plan = latest.join("plan.md").is_file();
+    let has_unplaced_migration = detect_unplaced_migration(&latest);
+    let pipeline_stage = compute_pipeline_stage(has_change_summary, has_unplaced_migration, has_plan);
     let path_str = latest
         .strip_prefix(cwd)
         .unwrap_or(&latest)
@@ -122,7 +146,47 @@ fn latest_run(cwd: &Path, pending: &[String]) -> Result<Option<ExistingRun>> {
         new_pending_since_run,
         has_change_summary,
         has_plan,
+        has_unplaced_migration,
+        pipeline_stage,
     }))
+}
+
+fn compute_pipeline_stage(
+    has_change_summary: bool,
+    has_unplaced_migration: bool,
+    has_plan: bool,
+) -> PipelineStage {
+    if !has_change_summary {
+        PipelineStage::ChangeSummaryPending
+    } else if has_unplaced_migration {
+        PipelineStage::SqlMigrationPending
+    } else if !has_plan {
+        PipelineStage::PlanPending
+    } else {
+        PipelineStage::ImplPending
+    }
+}
+
+/// True iff `<run>/migration/` contains at least one `V*_pending__*.sql`
+/// file — the placeholder name written by sql-migration Step 4 before
+/// `migration place` rewrites the index.
+fn detect_unplaced_migration(run_dir: &Path) -> bool {
+    let mig_dir = run_dir.join("migration");
+    if !mig_dir.is_dir() {
+        return false;
+    }
+    let re = regex::Regex::new(r"^V\d+_pending__.+\.sql$").unwrap();
+    fs::read_dir(&mig_dir)
+        .ok()
+        .map(|it| {
+            it.filter_map(|e| e.ok()).any(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| re.is_match(n))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -171,6 +235,8 @@ mod tests {
         assert!(run.new_pending_since_run.is_empty());
         assert!(!run.has_change_summary);
         assert!(!run.has_plan);
+        assert!(!run.has_unplaced_migration);
+        assert_eq!(run.pipeline_stage, PipelineStage::ChangeSummaryPending);
     }
 
     #[test]
@@ -227,6 +293,67 @@ mod tests {
         let run = s.existing_run.unwrap();
         assert!(run.has_change_summary);
         assert!(run.has_plan);
+        assert_eq!(run.pipeline_stage, PipelineStage::ImplPending);
+    }
+
+    #[test]
+    fn pipeline_stage_plan_pending_when_summary_present_no_plan() {
+        let tmp = tempdir().unwrap();
+        write(&tmp.path().join("docs/changes/pending/foo.md"), "x");
+        write(
+            &tmp.path().join(".jkit/2026-04-24-r/.change-files"),
+            "foo.md\n",
+        );
+        write(&tmp.path().join(".jkit/2026-04-24-r/change-summary.md"), "");
+        let s = compute(tmp.path()).unwrap();
+        let run = s.existing_run.unwrap();
+        assert!(run.has_change_summary);
+        assert!(!run.has_plan);
+        assert!(!run.has_unplaced_migration);
+        assert_eq!(run.pipeline_stage, PipelineStage::PlanPending);
+    }
+
+    #[test]
+    fn pipeline_stage_sql_migration_pending_when_unplaced_sql_present() {
+        let tmp = tempdir().unwrap();
+        write(&tmp.path().join("docs/changes/pending/foo.md"), "x");
+        write(
+            &tmp.path().join(".jkit/2026-04-24-r/.change-files"),
+            "foo.md\n",
+        );
+        write(&tmp.path().join(".jkit/2026-04-24-r/change-summary.md"), "");
+        write(
+            &tmp.path()
+                .join(".jkit/2026-04-24-r/migration/V20260424_pending__add_invoice.sql"),
+            "-- placeholder",
+        );
+        let s = compute(tmp.path()).unwrap();
+        let run = s.existing_run.unwrap();
+        assert!(run.has_unplaced_migration);
+        assert_eq!(run.pipeline_stage, PipelineStage::SqlMigrationPending);
+    }
+
+    #[test]
+    fn placed_migration_filename_does_not_count_as_unplaced() {
+        // After `migration place` rewrites the index, files are named
+        // `V<idx>__<slug>.sql` (no `_pending` token). Even if such a file
+        // accidentally lingers in the run dir, it shouldn't trigger the gate.
+        let tmp = tempdir().unwrap();
+        write(&tmp.path().join("docs/changes/pending/foo.md"), "x");
+        write(
+            &tmp.path().join(".jkit/2026-04-24-r/.change-files"),
+            "foo.md\n",
+        );
+        write(&tmp.path().join(".jkit/2026-04-24-r/change-summary.md"), "");
+        write(
+            &tmp.path()
+                .join(".jkit/2026-04-24-r/migration/V42__add_invoice.sql"),
+            "-- already-placed copy",
+        );
+        let s = compute(tmp.path()).unwrap();
+        let run = s.existing_run.unwrap();
+        assert!(!run.has_unplaced_migration);
+        assert_eq!(run.pipeline_stage, PipelineStage::PlanPending);
     }
 
     #[test]
