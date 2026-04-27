@@ -37,17 +37,20 @@ pub enum ChangesCmd {
         date: Option<String>,
     },
     /// Emit a `change-summary.md` skeleton into the run dir with deterministic fields filled.
+    /// Gap counts (total + domains-with-gaps) are derived internally — pass `--domains` to
+    /// scope the count, or omit to scan every subdir of `docs/domains/`.
     Summary {
         #[arg(long)]
         run: PathBuf,
         #[arg(long)]
         feature: String,
-        /// Total unimplemented scenarios across all affected domains.
-        #[arg(long, default_value_t = 0)]
-        gap_total: u32,
-        /// Number of affected domains with at least one gap.
-        #[arg(long, default_value_t = 0)]
-        gap_domains: u32,
+        /// Comma-separated affected-domain slugs to scope the gap count.
+        /// Default: scan every subdir of `docs/domains/`.
+        #[arg(long, value_delimiter = ',')]
+        domains: Option<Vec<String>>,
+        /// JUnit test source root.
+        #[arg(long, default_value = "src/test/java/")]
+        test_root: PathBuf,
         #[arg(long)]
         date: Option<String>,
     },
@@ -78,14 +81,14 @@ pub fn run(cmd: ChangesCmd) -> Result<()> {
         ChangesCmd::Summary {
             run,
             feature,
-            gap_total,
-            gap_domains,
+            domains,
+            test_root,
             date,
         } => summary::run(summary::SummaryArgs {
             run,
             feature,
-            gap_total,
-            gap_domains,
+            domains,
+            test_root,
             date,
         }),
         ChangesCmd::Complete { run, no_amend } => complete::run(&run, no_amend),

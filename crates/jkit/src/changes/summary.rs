@@ -4,13 +4,17 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::scenarios::gap;
 use crate::util::{atomic_write, print_json};
 
 pub struct SummaryArgs {
     pub run: PathBuf,
     pub feature: String,
-    pub gap_total: u32,
-    pub gap_domains: u32,
+    /// Domains scoped to this change; gap counts are computed only for these.
+    /// `None` ⇒ scan all subdirs of `docs/domains/` (best-effort fallback).
+    pub domains: Option<Vec<String>>,
+    /// JUnit test source root. Default: `src/test/java/` (set by clap).
+    pub test_root: PathBuf,
     pub date: Option<String>,
 }
 
@@ -18,6 +22,8 @@ pub struct SummaryArgs {
 struct SummaryReport {
     summary_path: String,
     todos: Vec<&'static str>,
+    gap_total: u32,
+    gap_domains: u32,
 }
 
 pub fn run(args: SummaryArgs) -> Result<()> {
@@ -54,13 +60,25 @@ fn generate(cwd: &Path, args: SummaryArgs) -> Result<SummaryReport> {
         .clone()
         .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
 
-    let markdown = render_markdown(
-        &args.feature,
-        &date,
-        &change_files,
-        args.gap_total,
-        args.gap_domains,
-    );
+    let domains_root = cwd.join("docs/domains");
+    let domain_list = match args.domains.as_ref() {
+        Some(d) => d.clone(),
+        None => list_domain_subdirs(&domains_root)?,
+    };
+    let test_root = if args.test_root.is_absolute() {
+        args.test_root.clone()
+    } else {
+        cwd.join(&args.test_root)
+    };
+    let counts = if domain_list.is_empty() {
+        Vec::new()
+    } else {
+        gap::count_gaps_per_domain(&domains_root, &domain_list, &test_root)?
+    };
+    let gap_total: u32 = counts.iter().map(|(_, c)| *c as u32).sum();
+    let gap_domains: u32 = counts.iter().filter(|(_, c)| *c > 0).count() as u32;
+
+    let markdown = render_markdown(&args.feature, &date, &change_files, gap_total, gap_domains);
 
     let summary_path = run_dir.join("change-summary.md");
     atomic_write(&summary_path, markdown.as_bytes())?;
@@ -76,7 +94,23 @@ fn generate(cwd: &Path, args: SummaryArgs) -> Result<SummaryReport> {
             "Schema Change Required (Yes/No + one-line summary if Yes)",
             "Assumptions (or remove the section if no defaults were silently picked)",
         ],
+        gap_total,
+        gap_domains,
     })
+}
+
+fn list_domain_subdirs(domains_root: &Path) -> Result<Vec<String>> {
+    if !domains_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = fs::read_dir(domains_root)
+        .with_context(|| format!("reading {}", domains_root.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    out.sort();
+    Ok(out)
 }
 
 fn render_markdown(
@@ -121,45 +155,77 @@ mod tests {
         run
     }
 
+    fn write_yaml(cwd: &Path, rel: &str, contents: &str) {
+        let p = cwd.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, contents).unwrap();
+    }
+
+    fn args(domains: Option<Vec<String>>) -> SummaryArgs {
+        SummaryArgs {
+            run: PathBuf::from(".jkit/2026-04-24-feat"),
+            feature: "feat".into(),
+            domains,
+            test_root: PathBuf::from("src/test/java"),
+            date: Some("2026-04-24".into()),
+        }
+    }
+
     #[test]
-    fn writes_skeleton_with_deterministic_fields() {
+    fn writes_skeleton_with_derived_gap_counts() {
         let tmp = tempdir().unwrap();
         let run = setup_run(tmp.path(), "a.md\nb.md\n");
+        write_yaml(
+            tmp.path(),
+            "docs/domains/billing/test-scenarios.yaml",
+            "- endpoint: POST /x\n  id: a-b\n  description: foo\n- endpoint: POST /x\n  id: c-d\n  description: bar\n",
+        );
+        write_yaml(
+            tmp.path(),
+            "docs/domains/inventory/test-scenarios.yaml",
+            "- endpoint: GET /y\n  id: e-f\n  description: baz\n",
+        );
         let report = generate(
             tmp.path(),
-            SummaryArgs {
-                run: PathBuf::from(".jkit/2026-04-24-feat"),
-                feature: "feat".into(),
-                gap_total: 5,
-                gap_domains: 2,
-                date: Some("2026-04-24".into()),
-            },
+            args(Some(vec!["billing".into(), "inventory".into()])),
         )
         .unwrap();
+        assert_eq!(report.gap_total, 3);
+        assert_eq!(report.gap_domains, 2);
         let body = fs::read_to_string(run.join("change-summary.md")).unwrap();
         assert!(body.contains("# Change Summary: feat"));
         assert!(body.contains("**Date:** 2026-04-24"));
         assert!(body.contains("**Change files:** a.md, b.md"));
-        assert!(body.contains("5 unimplemented across 2 domains"));
-        assert!(body.contains("<!-- TODO:"));
+        assert!(body.contains("3 unimplemented across 2 domains"));
         assert_eq!(report.todos.len(), 3);
     }
 
     #[test]
-    fn omits_gap_section_when_zero() {
+    fn skips_implemented_scenarios_in_count() {
         let tmp = tempdir().unwrap();
         setup_run(tmp.path(), "a.md\n");
-        generate(
+        write_yaml(
             tmp.path(),
-            SummaryArgs {
-                run: PathBuf::from(".jkit/2026-04-24-feat"),
-                feature: "feat".into(),
-                gap_total: 0,
-                gap_domains: 0,
-                date: Some("2026-04-24".into()),
-            },
-        )
-        .unwrap();
+            "docs/domains/billing/test-scenarios.yaml",
+            "- endpoint: POST /x\n  id: a-b\n  description: foo\n- endpoint: POST /x\n  id: c-d\n  description: bar\n",
+        );
+        write_yaml(
+            tmp.path(),
+            "src/test/java/BillingTest.java",
+            "class BillingTest { @Test void aB() {} }",
+        );
+        let report = generate(tmp.path(), args(Some(vec!["billing".into()]))).unwrap();
+        assert_eq!(report.gap_total, 1, "aB is implemented; only c-d remains");
+        assert_eq!(report.gap_domains, 1);
+    }
+
+    #[test]
+    fn omits_gap_section_when_no_gaps() {
+        let tmp = tempdir().unwrap();
+        setup_run(tmp.path(), "a.md\n");
+        let report = generate(tmp.path(), args(Some(vec![]))).unwrap();
+        assert_eq!(report.gap_total, 0);
+        assert_eq!(report.gap_domains, 0);
         let body =
             fs::read_to_string(tmp.path().join(".jkit/2026-04-24-feat/change-summary.md")).unwrap();
         assert!(!body.contains("## Test Scenario Gaps"));
@@ -169,20 +235,34 @@ mod tests {
     fn singular_domain_in_gap_line() {
         let tmp = tempdir().unwrap();
         setup_run(tmp.path(), "a.md\n");
-        generate(
+        write_yaml(
             tmp.path(),
-            SummaryArgs {
-                run: PathBuf::from(".jkit/2026-04-24-feat"),
-                feature: "feat".into(),
-                gap_total: 3,
-                gap_domains: 1,
-                date: Some("2026-04-24".into()),
-            },
-        )
-        .unwrap();
+            "docs/domains/billing/test-scenarios.yaml",
+            "- endpoint: POST /x\n  id: a-b\n  description: foo\n- endpoint: POST /x\n  id: c-d\n  description: bar\n- endpoint: POST /x\n  id: e-f\n  description: baz\n",
+        );
+        generate(tmp.path(), args(Some(vec!["billing".into()]))).unwrap();
         let body =
             fs::read_to_string(tmp.path().join(".jkit/2026-04-24-feat/change-summary.md")).unwrap();
         assert!(body.contains("3 unimplemented across 1 domain —"));
+    }
+
+    #[test]
+    fn no_domains_arg_falls_back_to_scanning_all_domain_subdirs() {
+        let tmp = tempdir().unwrap();
+        setup_run(tmp.path(), "a.md\n");
+        write_yaml(
+            tmp.path(),
+            "docs/domains/billing/test-scenarios.yaml",
+            "- endpoint: GET /x\n  id: a-b\n  description: foo\n",
+        );
+        write_yaml(
+            tmp.path(),
+            "docs/domains/inventory/test-scenarios.yaml",
+            "- endpoint: GET /y\n  id: c-d\n  description: bar\n",
+        );
+        let report = generate(tmp.path(), args(None)).unwrap();
+        assert_eq!(report.gap_total, 2);
+        assert_eq!(report.gap_domains, 2);
     }
 
     #[test]
@@ -193,8 +273,8 @@ mod tests {
             SummaryArgs {
                 run: PathBuf::from(".jkit/missing"),
                 feature: "feat".into(),
-                gap_total: 0,
-                gap_domains: 0,
+                domains: Some(vec![]),
+                test_root: PathBuf::from("src/test/java"),
                 date: None,
             },
         )
@@ -211,8 +291,8 @@ mod tests {
             SummaryArgs {
                 run: PathBuf::from(".jkit/2026-04-24-feat"),
                 feature: "feat".into(),
-                gap_total: 0,
-                gap_domains: 0,
+                domains: Some(vec![]),
+                test_root: PathBuf::from("src/test/java"),
                 date: None,
             },
         )

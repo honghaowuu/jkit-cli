@@ -215,6 +215,53 @@ pub fn id_to_camel(id: &str) -> String {
     id.to_lower_camel_case()
 }
 
+/// Count unimplemented scenarios per domain.
+///
+/// For each domain in `domains`, scans the domain's `test-scenarios.yaml` (flat
+/// layout) or each per-api-type `test-scenarios.yaml` (multi-type layout) under
+/// `domains_root` and counts entries whose camelCased id has no matching JUnit
+/// `void <name>(` declaration under `test_root`.
+///
+/// Domains whose yaml files don't exist contribute a count of 0. Returned in
+/// the same order as the input.
+pub fn count_gaps_per_domain(
+    domains_root: &Path,
+    domains: &[String],
+    test_root: &Path,
+) -> Result<Vec<(String, usize)>> {
+    let implemented = implemented_method_names(test_root)?;
+    let mut counts = Vec::with_capacity(domains.len());
+    for domain in domains {
+        let layout = domain_layout::detect_layout(domains_root, domain);
+        let yaml_paths: Vec<PathBuf> = match &layout {
+            DetectedLayout::MultiType(types) => types
+                .iter()
+                .map(|ty| {
+                    domains_root
+                        .join(domain)
+                        .join(ty.dir_name())
+                        .join("test-scenarios.yaml")
+                })
+                .collect(),
+            _ => vec![domains_root.join(domain).join("test-scenarios.yaml")],
+        };
+        let mut count = 0usize;
+        for yaml_path in &yaml_paths {
+            if !yaml_path.exists() {
+                continue;
+            }
+            let entries = load_scenarios(yaml_path)?;
+            for e in &entries {
+                if !implemented.contains(&id_to_camel(&e.id)) {
+                    count += 1;
+                }
+            }
+        }
+        counts.push((domain.clone(), count));
+    }
+    Ok(counts)
+}
+
 /// Walk the test root, collect every method name appearing in `void <name>(`.
 fn implemented_method_names(test_root: &Path) -> Result<HashSet<String>> {
     let mut set = HashSet::new();
