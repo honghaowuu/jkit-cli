@@ -12,8 +12,11 @@ pub struct CompleteReport {
     already_done: Vec<String>,
     missing: Vec<String>,
     archived_run_dir: String,
-    git_amended: bool,
-    /// Populated when one of the git steps (add or amend) fails. The file
+    /// `true` when this invocation created a `chore(complete): <feature>` commit.
+    /// `false` when there was nothing to commit (re-run after a successful run)
+    /// or when `--no-commit` was passed.
+    git_committed: bool,
+    /// Populated when one of the git steps (add or commit) fails. The file
     /// moves and the run-dir archive are independent of git, so a git failure
     /// surfaces as a non-fatal warning rather than failing the whole command.
     /// Multiple step errors are joined with `; `.
@@ -21,13 +24,13 @@ pub struct CompleteReport {
     git_error: Option<String>,
 }
 
-pub fn run(run: &Path, no_amend: bool) -> Result<()> {
+pub fn run(run: &Path, no_commit: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("reading cwd")?;
-    let report = complete(&cwd, run, no_amend)?;
+    let report = complete(&cwd, run, no_commit)?;
     print_json(&report)
 }
 
-pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteReport> {
+pub fn complete(cwd: &Path, run_arg: &Path, no_commit: bool) -> Result<CompleteReport> {
     let run_dir_input = if run_arg.is_absolute() {
         run_arg.to_path_buf()
     } else {
@@ -103,7 +106,9 @@ pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteRe
         })?;
     }
 
-    let (git_amended, git_error) = if no_amend {
+    let feature = feature_from_run_name(&run_name.to_string_lossy());
+
+    let (git_committed, git_error) = if no_commit {
         (false, None)
     } else {
         let docs_changes = cwd.join("docs/changes/");
@@ -115,14 +120,23 @@ pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteRe
         if let Err(e) = git_add(&jkit_done) {
             errors.push(format!("git add .jkit/done/: {e}"));
         }
-        let amended = match git_amend() {
-            Ok(()) => true,
+        // Skip the commit when nothing is staged — happens on a re-run after a
+        // prior invocation already committed everything. Treat as success-no-op.
+        let committed = match git_has_staged_changes() {
+            Ok(false) => false,
+            Ok(true) => match git_commit(&feature) {
+                Ok(()) => true,
+                Err(e) => {
+                    errors.push(format!("git commit: {e}"));
+                    false
+                }
+            },
             Err(e) => {
-                errors.push(format!("git commit --amend: {e}"));
+                errors.push(format!("git diff --staged: {e}"));
                 false
             }
         };
-        (amended, if errors.is_empty() { None } else { Some(errors.join("; ")) })
+        (committed, if errors.is_empty() { None } else { Some(errors.join("; ")) })
     };
 
     Ok(CompleteReport {
@@ -134,9 +148,34 @@ pub fn complete(cwd: &Path, run_arg: &Path, no_amend: bool) -> Result<CompleteRe
             .unwrap_or(&archived)
             .to_string_lossy()
             .into_owned(),
-        git_amended,
+        git_committed,
         git_error,
     })
+}
+
+/// Strip a leading `YYYY-MM-DD-` from the run-dir basename to recover the
+/// feature slug. If the prefix is missing, return the whole name unchanged.
+fn feature_from_run_name(run_name: &str) -> String {
+    let bytes = run_name.as_bytes();
+    let is_digit = |b: u8| b.is_ascii_digit();
+    let dash = |b: u8| b == b'-';
+    if bytes.len() > 11
+        && is_digit(bytes[0])
+        && is_digit(bytes[1])
+        && is_digit(bytes[2])
+        && is_digit(bytes[3])
+        && dash(bytes[4])
+        && is_digit(bytes[5])
+        && is_digit(bytes[6])
+        && dash(bytes[7])
+        && is_digit(bytes[8])
+        && is_digit(bytes[9])
+        && dash(bytes[10])
+    {
+        run_name[11..].to_string()
+    } else {
+        run_name.to_string()
+    }
 }
 
 /// Returns `Ok(())` when `git add <path>` succeeds and `Err(stderr_text)`
@@ -158,21 +197,48 @@ fn git_add(path: &Path) -> std::result::Result<(), String> {
     }
 }
 
-/// Returns `Ok(())` when `git commit --amend --no-edit` succeeds and
-/// `Err(stderr_text)` otherwise.
-fn git_amend() -> std::result::Result<(), String> {
-    match Command::new("git").args(["commit", "--amend", "--no-edit"]).output() {
+/// Returns `Ok(true)` when there are staged changes ready to commit,
+/// `Ok(false)` when staging is empty (no-op commit case), and
+/// `Err(stderr_text)` if `git diff` itself failed.
+fn git_has_staged_changes() -> std::result::Result<bool, String> {
+    match Command::new("git")
+        .args(["diff", "--staged", "--quiet"])
+        .output()
+    {
+        // exit 0 → no staged changes; exit 1 → staged changes present
+        Ok(o) => match o.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            Some(c) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                Err(if stderr.is_empty() {
+                    format!("git diff --staged --quiet exited {c}")
+                } else {
+                    format!("git diff --staged --quiet exited {c}: {stderr}")
+                })
+            }
+            None => Err("git diff --staged --quiet killed by signal".into()),
+        },
+        Err(e) => Err(format!("git diff invocation failed: {e}")),
+    }
+}
+
+/// Returns `Ok(())` when `git commit -m "chore(complete): <feature>"` succeeds
+/// and `Err(stderr_text)` otherwise.
+fn git_commit(feature: &str) -> std::result::Result<(), String> {
+    let msg = format!("chore(complete): {feature}");
+    match Command::new("git").args(["commit", "-m", &msg]).output() {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
             let exit = o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
             Err(if stderr.is_empty() {
-                format!("git commit --amend exited {exit}")
+                format!("git commit exited {exit}")
             } else {
-                format!("git commit --amend exited {exit}: {stderr}")
+                format!("git commit exited {exit}: {stderr}")
             })
         }
-        Err(e) => Err(format!("git commit --amend invocation failed: {e}")),
+        Err(e) => Err(format!("git commit invocation failed: {e}")),
     }
 }
 
@@ -208,11 +274,11 @@ mod tests {
     fn moves_pending_to_done_and_archives_run() {
         let tmp = tempdir().unwrap();
         let run = setup(tmp.path(), &["a.md", "b.md"]);
-        let report = complete(tmp.path(), &run, true).unwrap();
+        let report = complete(tmp.path(), &run, /* no_commit */ true).unwrap();
         assert_eq!(report.moved, vec!["a.md", "b.md"]);
         assert!(report.already_done.is_empty());
         assert!(report.missing.is_empty());
-        assert!(!report.git_amended);
+        assert!(!report.git_committed);
         assert!(tmp.path().join("docs/changes/done/a.md").is_file());
         assert!(tmp.path().join("docs/changes/done/b.md").is_file());
         assert!(!run.exists());
@@ -231,7 +297,7 @@ mod tests {
             tmp.path().join("docs/changes/done/a.md"),
         )
         .unwrap();
-        let report = complete(tmp.path(), &run, true).unwrap();
+        let report = complete(tmp.path(), &run, /* no_commit */ true).unwrap();
         assert!(report.moved.is_empty());
         assert_eq!(report.already_done, vec!["a.md"]);
         assert!(report.missing.is_empty());
@@ -243,7 +309,7 @@ mod tests {
         let run = setup(tmp.path(), &["ghost.md"]);
         // Remove the pending file before complete runs.
         fs::remove_file(tmp.path().join("docs/changes/pending/ghost.md")).unwrap();
-        let report = complete(tmp.path(), &run, true).unwrap();
+        let report = complete(tmp.path(), &run, /* no_commit */ true).unwrap();
         assert_eq!(report.missing, vec!["ghost.md"]);
     }
 
@@ -252,7 +318,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let run = setup(tmp.path(), &["a.md"]);
         fs::create_dir_all(tmp.path().join(".jkit/done/2026-04-25-feat")).unwrap();
-        let err = complete(tmp.path(), &run, true).unwrap_err();
+        let err = complete(tmp.path(), &run, /* no_commit */ true).unwrap_err();
         assert!(err.to_string().contains("archive collision"));
     }
 
@@ -277,7 +343,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join(".jkit/done")).unwrap();
         fs::rename(&run, tmp.path().join(".jkit/done/2026-04-25-feat")).unwrap();
 
-        let report = complete(tmp.path(), &run, true).expect("resume should succeed");
+        let report = complete(tmp.path(), &run, /* no_commit */ true).expect("resume should succeed");
         assert_eq!(report.already_done, vec!["a.md", "b.md"]);
         assert!(report.moved.is_empty());
         assert!(report.archived_run_dir.ends_with(".jkit/done/2026-04-25-feat"));
@@ -295,7 +361,19 @@ mod tests {
         let tmp = tempdir().unwrap();
         let run = tmp.path().join(".jkit/2026-04-25-feat");
         fs::create_dir_all(&run).unwrap();
-        let err = complete(tmp.path(), &run, true).unwrap_err();
+        let err = complete(tmp.path(), &run, /* no_commit */ true).unwrap_err();
         assert!(err.to_string().contains(".change-files missing"));
+    }
+
+    #[test]
+    fn feature_slug_strips_date_prefix() {
+        assert_eq!(feature_from_run_name("2026-04-25-billing-bulk-invoice"), "billing-bulk-invoice");
+        assert_eq!(feature_from_run_name("2026-04-25-x"), "x");
+    }
+
+    #[test]
+    fn feature_slug_passthrough_when_no_date_prefix() {
+        assert_eq!(feature_from_run_name("custom-name"), "custom-name");
+        assert_eq!(feature_from_run_name("short"), "short");
     }
 }

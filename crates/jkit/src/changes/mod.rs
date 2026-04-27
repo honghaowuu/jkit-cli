@@ -55,13 +55,14 @@ pub enum ChangesCmd {
         date: Option<String>,
     },
     /// Close a run: move .change-files entries from pending/ to done/, archive the run
-    /// dir to .jkit/done/, stage the changes, and amend HEAD.
+    /// dir to .jkit/done/, stage the changes, and create a `chore(complete): <feature>` commit.
     Complete {
         #[arg(long)]
         run: PathBuf,
-        /// Skip the `git add` + `git commit --amend` step (useful for tests).
+        /// Skip the `git add` + `git commit` step (useful for tests, or when the
+        /// caller wants to stage the changes themselves).
         #[arg(long)]
-        no_amend: bool,
+        no_commit: bool,
     },
     /// Read-only diagnostic: detect inconsistencies between .change-files,
     /// docs/changes/{pending,done}/, and active run dirs.
@@ -91,7 +92,7 @@ pub fn run(cmd: ChangesCmd) -> Result<()> {
             test_root,
             date,
         }),
-        ChangesCmd::Complete { run, no_amend } => complete::run(&run, no_amend),
+        ChangesCmd::Complete { run, no_commit } => complete::run(&run, no_commit),
         ChangesCmd::Doctor => doctor::run(),
     }
 }
