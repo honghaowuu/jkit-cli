@@ -24,8 +24,11 @@ pub enum ChangesCmd {
     },
     /// Create `.jkit/<date>-<feature>/` and write `.change-files`. Idempotent on identical input.
     Init {
+        /// Slug for the run dir. Optional when `--files` lists exactly one change file
+        /// (slug is then derived from the file's basename, stripping any leading
+        /// `YYYY-MM-DD-` and the `.md` suffix). Required for multi-file runs.
         #[arg(long)]
-        feature: String,
+        feature: Option<String>,
         /// Comma-separated change-file basenames to record.
         #[arg(long, value_delimiter = ',', required = true)]
         files: Vec<String>,
@@ -71,7 +74,7 @@ pub fn run(cmd: ChangesCmd) -> Result<()> {
             feature,
             files,
             date,
-        } => init::run(&feature, &files, date.as_deref()),
+        } => init::run(feature.as_deref(), &files, date.as_deref()),
         ChangesCmd::Summary {
             run,
             feature,
