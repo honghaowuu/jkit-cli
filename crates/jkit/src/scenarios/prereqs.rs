@@ -40,6 +40,15 @@ pub fn run(apply: bool, pom_path: &Path) -> Result<()> {
     let mut actions_taken: Vec<String> = Vec::new();
     let mut blocking_errors: Vec<String> = Vec::new();
 
+    if strategy == "testcontainers" {
+        runtime = probe_container_runtime();
+        if runtime.is_none() {
+            blocking_errors.push(
+                "no container runtime found (tried docker, podman) — Testcontainers requires one to run integration tests".to_string(),
+            );
+        }
+    }
+
     if strategy == "compose" {
         runtime = probe_runtime();
         if runtime.is_none() {
@@ -92,6 +101,19 @@ fn pick_strategy(sb_version: &str) -> &'static str {
     } else {
         "compose"
     }
+}
+
+/// Probe for any container runtime usable by Testcontainers (`docker` or
+/// `podman` binary on PATH). Different from `probe_runtime`, which checks
+/// for the compose-plugin variants used by the legacy compose strategy.
+fn probe_container_runtime() -> Option<String> {
+    if which::which("docker").is_ok() {
+        return Some("docker".into());
+    }
+    if which::which("podman").is_ok() {
+        return Some("podman".into());
+    }
+    None
 }
 
 fn probe_runtime() -> Option<String> {

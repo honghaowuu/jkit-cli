@@ -112,13 +112,19 @@ pub fn complete(cwd: &Path, run_arg: &Path, no_commit: bool) -> Result<CompleteR
         (false, None)
     } else {
         let docs_changes = cwd.join("docs/changes/");
-        let jkit_done = cwd.join(".jkit/done/");
+        // The original `.jkit/<active-run>/` path was tracked by the spec
+        // and plan commits; archiving moved its files to `.jkit/done/<run>/`,
+        // which is gitignored. We need to stage the deletion of the original
+        // path (`git add -u`) so the chore(complete): commit cleanly closes
+        // the run with no leftover unstaged deletions in the working tree.
+        // We do NOT `git add .jkit/done/` — it's gitignored and would error.
+        let original_run_path = cwd.join(".jkit").join(&run_name);
         let mut errors: Vec<String> = Vec::new();
         if let Err(e) = git_add(&docs_changes) {
             errors.push(format!("git add docs/changes/: {e}"));
         }
-        if let Err(e) = git_add(&jkit_done) {
-            errors.push(format!("git add .jkit/done/: {e}"));
+        if let Err(e) = git_add_update(&original_run_path) {
+            errors.push(format!("git add -u .jkit/{}: {e}", run_name.to_string_lossy()));
         }
         // Skip the commit when nothing is staged — happens on a re-run after a
         // prior invocation already committed everything. Treat as success-no-op.
@@ -175,6 +181,27 @@ fn feature_from_run_name(run_name: &str) -> String {
         run_name[11..].to_string()
     } else {
         run_name.to_string()
+    }
+}
+
+/// `git add -u <path>` — stages tracked-file modifications AND deletions
+/// under `<path>`. Used to record the disappearance of the original
+/// `.jkit/<run>/` tracked files after the run dir was archived to
+/// `.jkit/done/<run>/`. If the path was never tracked (e.g. an ad-hoc run
+/// that was never committed), this is a no-op.
+fn git_add_update(path: &Path) -> std::result::Result<(), String> {
+    match Command::new("git").args(["add", "-u"]).arg(path).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let exit = o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
+            Err(if stderr.is_empty() {
+                format!("git add -u exited {exit}")
+            } else {
+                format!("git add -u exited {exit}: {stderr}")
+            })
+        }
+        Err(e) => Err(format!("git add -u invocation failed: {e}")),
     }
 }
 

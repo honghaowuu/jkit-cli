@@ -48,9 +48,23 @@ struct GapEntryAggregated {
     api_type: Option<ApiType>,
 }
 
+/// `kit scenarios skip` writes a flat JSON array of records;
+/// older designs used an envelope `{ "skipped": [...] }`. Accept both
+/// transparently — the reader is the cheaper side to keep flexible.
 #[derive(Debug, Deserialize)]
-struct SkippedScenarios {
-    skipped: Vec<SkippedEntry>,
+#[serde(untagged)]
+enum SkippedScenarios {
+    Envelope { skipped: Vec<SkippedEntry> },
+    Flat(Vec<SkippedEntry>),
+}
+
+impl SkippedScenarios {
+    fn into_entries(self) -> Vec<SkippedEntry> {
+        match self {
+            SkippedScenarios::Envelope { skipped } => skipped,
+            SkippedScenarios::Flat(v) => v,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +112,12 @@ fn run_single(domain: &str, test_root: &Path) -> Result<()> {
     };
 
     let implemented = implemented_method_names(test_root)?;
+    // Per-domain mode: union skip records from any archived `.jkit/done/<*>/`
+    // run dir. Active run dirs are only relevant for `--run` mode (handled by
+    // run_aggregated). Without this, scenarios already explicitly skipped in a
+    // prior pipeline run reappear as gaps in /post-edit's per-domain query.
+    let skipped = load_skip_records(&archived_run_dirs())?;
+
     let mut out: Vec<GapEntrySingle> = Vec::new();
 
     for (api_type, yaml_path) in &buckets {
@@ -107,17 +127,79 @@ fn run_single(domain: &str, test_root: &Path) -> Result<()> {
         let entries = load_scenarios(yaml_path)?;
         for e in &entries {
             let camel = id_to_camel(&e.id);
-            if !implemented.contains(&camel) {
-                out.push(GapEntrySingle {
-                    endpoint: e.endpoint.clone(),
-                    id: e.id.clone(),
-                    description: e.description.clone(),
-                    api_type: *api_type,
-                });
+            if implemented.contains(&camel) {
+                continue;
             }
+            let key = (domain.to_string(), e.endpoint.clone(), e.id.clone());
+            if skipped.contains(&key) {
+                continue;
+            }
+            out.push(GapEntrySingle {
+                endpoint: e.endpoint.clone(),
+                id: e.id.clone(),
+                description: e.description.clone(),
+                api_type: *api_type,
+            });
         }
     }
     print_json(&serde_json::json!({ "gaps": out }))
+}
+
+/// Load + union skip records from each given run directory's
+/// `skipped-scenarios.json`. Tolerates both the envelope and flat array
+/// formats (see `SkippedScenarios`).
+fn load_skip_records(run_dirs: &[PathBuf]) -> Result<HashSet<(String, String, String)>> {
+    let mut set: HashSet<(String, String, String)> = HashSet::new();
+    for run in run_dirs {
+        let p = run.join("skipped-scenarios.json");
+        if !p.exists() {
+            continue;
+        }
+        let text = fs::read_to_string(&p)?;
+        let s: SkippedScenarios = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", p.display()))?;
+        for e in s.into_entries() {
+            set.insert((e.domain, e.endpoint, e.id));
+        }
+    }
+    Ok(set)
+}
+
+/// All archived runs under `.jkit/done/<*>/`. Empty when the dir is absent.
+fn archived_run_dirs() -> Vec<PathBuf> {
+    let done = PathBuf::from(".jkit/done");
+    if !done.is_dir() {
+        return Vec::new();
+    }
+    fs::read_dir(&done)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sanitize an identifier for use as a Java package segment: replace any
+/// non-`[A-Za-z0-9_]` char with `_`, and prefix `_` if it starts with a digit.
+/// `jkit-demo` → `jkit_demo`.
+fn sanitize_pkg_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        let mut prefixed = String::with_capacity(out.len() + 1);
+        prefixed.push('_');
+        prefixed.push_str(&out);
+        out = prefixed;
+    }
+    out
 }
 
 fn run_aggregated(run_dir: &Path, test_root: &Path, pom_path: &Path) -> Result<()> {
@@ -130,20 +212,8 @@ fn run_aggregated(run_dir: &Path, test_root: &Path, pom_path: &Path) -> Result<(
     let domains = parse_affected_domains(&cs_text)
         .ok_or_else(|| anyhow::anyhow!("change-summary.md: '## Domains Changed' section not found"))?;
 
-    let skipped: HashSet<(String, String, String)> = {
-        let p = run_dir.join("skipped-scenarios.json");
-        if p.exists() {
-            let text = fs::read_to_string(&p)?;
-            let s: SkippedScenarios = serde_json::from_str(&text)
-                .with_context(|| format!("parsing {}", p.display()))?;
-            s.skipped
-                .into_iter()
-                .map(|e| (e.domain, e.endpoint, e.id))
-                .collect()
-        } else {
-            HashSet::new()
-        }
-    };
+    let skipped: HashSet<(String, String, String)> =
+        load_skip_records(&[run_dir.to_path_buf()])?;
 
     let implemented = implemented_method_names(test_root)?;
     let pom_meta = read_pom_coords(pom_path).ok();
@@ -425,11 +495,21 @@ fn resolve_test_class_path(
         }
     }
     let coords = pom?;
-    let group_path = coords.group_id.replace('.', "/");
+    // Sanitize each segment so the synthesized path is a valid Java package.
+    // groupId may contain hyphens (`com.foo-bar.baz` → `com/foo_bar/baz`),
+    // and artifactId commonly does (`jkit-demo` → `jkit_demo`).
+    let group_path: String = coords
+        .group_id
+        .split('.')
+        .map(sanitize_pkg_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    let artifact_seg = sanitize_pkg_segment(&coords.artifact_id);
+    let domain_seg = sanitize_pkg_segment(domain);
     let p = PathBuf::from(test_root)
         .join(&group_path)
-        .join(&coords.artifact_id)
-        .join(domain)
+        .join(&artifact_seg)
+        .join(&domain_seg)
         .join(format!("{}IntegrationTest.java", pascal));
     Some(p.to_string_lossy().into_owned())
 }
