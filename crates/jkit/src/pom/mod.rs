@@ -10,7 +10,7 @@ use std::path::PathBuf;
 pub enum PomCmd {
     /// Install a static profile of pom fragments (deps or plugins).
     Prereqs {
-        /// One of: testcontainers, compose, jacoco, quality, smart-doc
+        /// One of: testcontainers, compose, jacoco, quality, smart-doc, flyway
         #[arg(long)]
         profile: ProfileArg,
         /// Without it: report state, mutate nothing. With it: install missing fragments.
@@ -45,6 +45,7 @@ pub enum ProfileArg {
     Quality,
     #[value(name = "smart-doc")]
     SmartDoc,
+    Flyway,
 }
 
 impl ProfileArg {
@@ -55,6 +56,7 @@ impl ProfileArg {
             ProfileArg::Jacoco => "jacoco",
             ProfileArg::Quality => "quality",
             ProfileArg::SmartDoc => "smart-doc",
+            ProfileArg::Flyway => "flyway",
         }
     }
 }

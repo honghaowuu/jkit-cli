@@ -33,6 +33,7 @@ const COMPOSE: &str = include_str!("../../templates/pom-fragments/compose.xml");
 const JACOCO: &str = include_str!("../../templates/pom-fragments/jacoco.xml");
 const QUALITY: &str = include_str!("../../templates/pom-fragments/quality.xml");
 const SMART_DOC: &str = include_str!("../../templates/pom-fragments/smart-doc.xml");
+const FLYWAY: &str = include_str!("../../templates/pom-fragments/flyway.xml");
 
 fn profile_fragments(profile: ProfileArg) -> Vec<Fragment> {
     match profile {
@@ -117,6 +118,22 @@ fn profile_fragments(profile: ProfileArg) -> Vec<Fragment> {
             artifact_id: "smart-doc-maven-plugin",
             body: SMART_DOC,
         }],
+        ProfileArg::Flyway => vec![
+            Fragment {
+                id: "flyway-core",
+                kind: FragmentKind::Dependency,
+                group_id: "org.flywaydb",
+                artifact_id: "flyway-core",
+                body: extract_block(FLYWAY, 0),
+            },
+            Fragment {
+                id: "flyway-maven-plugin",
+                kind: FragmentKind::Plugin,
+                group_id: "org.flywaydb",
+                artifact_id: "flyway-maven-plugin",
+                body: extract_block(FLYWAY, 1),
+            },
+        ],
     }
 }
 
