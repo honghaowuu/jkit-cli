@@ -1,3 +1,6 @@
+pub mod apply;
+pub mod build_tool;
+pub mod check_prereqs;
 pub mod diff;
 pub mod place;
 
@@ -27,6 +30,16 @@ pub enum MigrationCmd {
         #[arg(long, default_value = "src/main/resources/db/migration/")]
         flyway_dir: PathBuf,
     },
+    /// Verify Flyway prerequisites (runtime dep + build-tool plugin) for Maven or Gradle.
+    CheckPrereqs {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+    },
+    /// Apply pending Flyway migrations via the project's build tool (`mvn flyway:migrate` or `gradle flywayMigrate`).
+    Apply {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+    },
 }
 
 pub fn run(cmd: MigrationCmd) -> Result<()> {
@@ -42,5 +55,7 @@ pub fn run(cmd: MigrationCmd) -> Result<()> {
             feature,
             flyway_dir,
         } => place::run(&run, &feature, &flyway_dir),
+        MigrationCmd::CheckPrereqs { project_root } => check_prereqs::run(&project_root),
+        MigrationCmd::Apply { project_root } => apply::run(&project_root),
     }
 }
