@@ -130,23 +130,43 @@ pub fn diagnose(cwd: &Path) -> Result<DoctorReport> {
         }
     }
 
-    // 5. Direct edits to docs/domains/ outside an active spec-delta run.
-    //    Best-effort via `git status --porcelain` — silently skip if git is unavailable.
+    // 5. Direct edits to the curated spec files outside an active spec-delta
+    //    run. Best-effort via `git status --porcelain` — silently skip if git
+    //    is unavailable.
     if active.is_empty() {
-        if let Some(modified) = git_modified_under(cwd, "docs/domains") {
-            if !modified.is_empty() {
-                findings.push(Finding {
-                    code: "direct_domain_edit",
-                    severity: "warning",
-                    message: format!(
-                        "docs/domains/ has {} uncommitted file(s) and no active spec-delta run is in flight. Direct edits to formal docs should typically go through /spec-delta.",
-                        modified.len()
-                    ),
-                    remediation:
-                        "Commit them as out-of-band work, or revert and write a change file in docs/changes/pending/."
-                            .to_string(),
-                });
+        let mut modified_specs: Vec<String> = Vec::new();
+        for path in ["docs/domains.yaml", "docs/test-scenarios.yaml"] {
+            if let Some(m) = git_modified_under(cwd, path) {
+                modified_specs.extend(m);
             }
+        }
+        if !modified_specs.is_empty() {
+            findings.push(Finding {
+                code: "direct_spec_edit",
+                severity: "warning",
+                message: format!(
+                    "{} has uncommitted edits and no active spec-delta run is in flight. Direct edits to the curated index / scenario catalog should go through /spec-delta.",
+                    modified_specs.join(", ")
+                ),
+                remediation:
+                    "Commit them as out-of-band work, or revert and write a change file in docs/changes/pending/."
+                        .to_string(),
+            });
+        }
+    }
+
+    // 6. Fold in `jkit domains doctor` findings so spec-delta's Step 2 sees
+    //    them in a single call. The domain-side `code` values
+    //    (`domains_yaml_absent`, `missing_description`, etc.) are already
+    //    distinct from the change-side codes — no namespace prefix needed.
+    if let Ok(domains_report) = crate::domains::doctor::diagnose(cwd) {
+        for f in domains_report.findings {
+            findings.push(Finding {
+                code: f.code,
+                severity: f.severity,
+                message: f.message,
+                remediation: f.remediation,
+            });
         }
     }
 
@@ -261,13 +281,24 @@ mod tests {
         fs::write(p, s).unwrap();
     }
 
+    /// `domains_yaml_absent` is folded in from `jkit domains doctor` and is
+    /// expected on a fresh project — filter it out for tests that assert
+    /// "no other findings."
+    fn changes_only(report: &DoctorReport) -> Vec<&Finding> {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.code != "domains_yaml_absent" && f.code != "domains_yaml_empty")
+            .collect()
+    }
+
     #[test]
     fn clean_project_returns_ok() {
         let tmp = tempdir().unwrap();
         write(&tmp.path().join("docs/changes/pending/foo.md"), "x");
         let report = diagnose(tmp.path()).unwrap();
         assert!(report.clean);
-        assert!(report.findings.is_empty());
+        assert!(changes_only(&report).is_empty());
     }
 
     #[test]
@@ -318,7 +349,7 @@ mod tests {
         // No active run: pending file is fine (awaiting next spec-delta cycle).
         write(&tmp.path().join("docs/changes/pending/orphan.md"), "x");
         let r1 = diagnose(tmp.path()).unwrap();
-        assert!(r1.findings.is_empty());
+        assert!(changes_only(&r1).is_empty());
 
         // Active run present, doesn't reference orphan.md → warning.
         write(&tmp.path().join(".jkit/2026-04-24-a/.change-files"), "real.md\n");
@@ -350,12 +381,12 @@ mod tests {
         write(&tmp.path().join("docs/changes/done/old.md"), "x");
         let report = diagnose(tmp.path()).unwrap();
         assert!(report.clean);
-        assert!(report.findings.is_empty());
+        assert!(changes_only(&report).is_empty());
     }
 
     #[test]
-    fn detects_direct_domain_edit_when_no_active_run() {
-        // Set up a git repo with a tracked docs/domains/ file modified.
+    fn detects_direct_spec_edit_when_no_active_run() {
+        // Set up a git repo with a tracked docs/domains.yaml modified.
         let tmp = tempdir().unwrap();
         std::process::Command::new("git")
             .args(["init", "-q"])
@@ -372,7 +403,10 @@ mod tests {
             .current_dir(tmp.path())
             .status()
             .unwrap();
-        write(&tmp.path().join("docs/domains/billing/api-spec.yaml"), "v: 1\n");
+        write(
+            &tmp.path().join("docs/domains.yaml"),
+            "domains:\n  billing:\n    description: a\n    use_when: b\n",
+        );
         std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(tmp.path())
@@ -384,18 +418,21 @@ mod tests {
             .status()
             .unwrap();
         // Now modify the file (uncommitted change).
-        write(&tmp.path().join("docs/domains/billing/api-spec.yaml"), "v: 2\n");
+        write(
+            &tmp.path().join("docs/domains.yaml"),
+            "domains:\n  billing:\n    description: changed\n    use_when: b\n",
+        );
 
         let report = diagnose(tmp.path()).unwrap();
         assert!(report.clean); // warning, not issue
         assert!(report
             .findings
             .iter()
-            .any(|f| f.code == "direct_domain_edit"));
+            .any(|f| f.code == "direct_spec_edit"));
     }
 
     #[test]
-    fn skips_direct_domain_edit_check_when_active_run_exists() {
+    fn skips_direct_spec_edit_check_when_active_run_exists() {
         let tmp = tempdir().unwrap();
         std::process::Command::new("git")
             .args(["init", "-q"])
@@ -412,7 +449,10 @@ mod tests {
             .current_dir(tmp.path())
             .status()
             .unwrap();
-        write(&tmp.path().join("docs/domains/billing/api-spec.yaml"), "v: 1\n");
+        write(
+            &tmp.path().join("docs/domains.yaml"),
+            "domains:\n  billing:\n    description: a\n    use_when: b\n",
+        );
         std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(tmp.path())
@@ -423,7 +463,10 @@ mod tests {
             .current_dir(tmp.path())
             .status()
             .unwrap();
-        write(&tmp.path().join("docs/domains/billing/api-spec.yaml"), "v: 2\n");
+        write(
+            &tmp.path().join("docs/domains.yaml"),
+            "domains:\n  billing:\n    description: changed\n    use_when: b\n",
+        );
         // Active run present — direct-edit check should be skipped.
         write(
             &tmp.path().join(".jkit/2026-04-25-feat/.change-files"),
@@ -435,6 +478,6 @@ mod tests {
         assert!(!report
             .findings
             .iter()
-            .any(|f| f.code == "direct_domain_edit"));
+            .any(|f| f.code == "direct_spec_edit"));
     }
 }
