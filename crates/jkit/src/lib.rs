@@ -10,6 +10,7 @@ pub mod init;
 pub mod migrate;
 pub mod migration;
 pub mod pom;
+pub mod proposed_api;
 pub mod scenarios;
 pub mod scenarios_yaml;
 pub mod standards;
