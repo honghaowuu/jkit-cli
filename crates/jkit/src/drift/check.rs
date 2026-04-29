@@ -2,22 +2,32 @@
 //! `<run>/proposed-api.yaml` (the immutable contract writing-plans
 //! authored) and the current state of the code via smartdoc.
 //!
-//! ## Diff scope this slice
+//! ## Diff scope
 //!
-//! - Per `(path, method)` declared in the proposal:
-//!     - `endpoint_missing_in_code` — proposal lists it; code doesn't have it
-//!     - `endpoint_added_in_code`   — proposal touches the path but code has
-//!       an additional method on the same path the proposal didn't declare
-//!     - `response_status_missing_in_code` / `response_status_added_in_code`
+//! Per `(path, method)` declared in the proposal:
 //!
-//! Schema-level diffs (request body fields, response shape, parameter
-//! changes) are deferred to a later slice — the proposal still requires
-//! them in `components.schemas`, but the diff doesn't compare structurally
-//! yet.
+//! - `endpoint_missing_in_code` — proposal lists it; code doesn't have it
+//! - `endpoint_added_in_code`   — proposal touches the path; code has an
+//!   extra method on the same path the proposal didn't declare
+//! - `response_status_missing_in_code` / `response_status_added_in_code`
+//! - `request_required_field_missing_in_code` / `..._added_in_code`
+//!   — set difference over each operation's required request body fields
+//!   (resolves `$ref` to `components.schemas`; recurses into `allOf`)
+//! - `parameter_missing_in_code` / `parameter_added_in_code`
+//!   — set difference over `(name, in)` pairs of declared parameters
+//! - `parameter_required_changed` — same `(name, in)`, different `required` flag
+//!
+//! Untouched paths in code (paths the proposal doesn't touch) intentionally
+//! do not surface as drift — the proposal is a strict delta of what changes,
+//! not a full surface.
+//!
+//! Response body schema diffs are deferred to a later slice — the proposal
+//! still requires `components.schemas` for added/modified shapes, but the
+//! diff doesn't compare response shapes structurally yet.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use serde_json::{json, Map, Value as JsonValue};
+use serde_json::{json, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -32,11 +42,7 @@ const HTTP_METHODS: &[&str] = &[
 
 #[derive(Serialize)]
 pub struct CheckReport {
-    /// True when no drift findings exist (or the proposal is absent).
-    /// Distinct from the envelope's `ok` (the command succeeded either way).
     pub ok: bool,
-    /// Set when the proposal is absent — drift check is a no-op for runs
-    /// that don't touch the public API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     pub run: String,
@@ -87,12 +93,12 @@ pub fn run(plan_path: &Path, pom_path: &Path) -> Result<()> {
 
     let proposal_text = fs::read_to_string(&proposal_path)
         .with_context(|| format!("reading {}", proposal_path.display()))?;
-    let proposal: YamlValue = serde_yaml::from_str(&proposal_text)
+    let proposal_yaml: YamlValue = serde_yaml::from_str(&proposal_text)
         .with_context(|| format!("parsing {} as YAML", proposal_path.display()))?;
 
     let code_spec = crate::migrate::smartdoc::run_smartdoc(pom_path)?;
 
-    let drift = diff(&proposal, &code_spec);
+    let drift = diff(&proposal_yaml, &code_spec);
     let ok = drift.is_empty();
     print_json(&CheckReport {
         ok,
@@ -102,21 +108,28 @@ pub fn run(plan_path: &Path, pom_path: &Path) -> Result<()> {
     })
 }
 
-/// Pure diff between the proposal (YAML Value) and code's OpenAPI spec
-/// (JSON Value from smartdoc). Symmetric: returns findings that go in
-/// either direction (`*_missing_in_code` and `*_added_in_code`).
+/// Pure diff between proposal (YAML) and code's smartdoc output (JSON).
+/// YAML is converted to JSON internally so the schema-walking helpers stay
+/// single-implementation.
 pub fn diff(proposal: &YamlValue, code: &JsonValue) -> Vec<DriftFinding> {
-    let proposed_paths = paths_from_yaml(proposal);
-    let code_paths = paths_from_json(code);
+    let proposal_json: JsonValue = serde_json::to_value(proposal).unwrap_or(JsonValue::Null);
+    diff_inner(&proposal_json, code)
+}
+
+fn diff_inner(proposal: &JsonValue, code: &JsonValue) -> Vec<DriftFinding> {
+    let proposed_paths = paths_from(proposal);
+    let code_paths = paths_from(code);
+    let proposal_components = proposal.get("components");
+    let code_components = code.get("components");
 
     let mut out: Vec<DriftFinding> = Vec::new();
 
     for (path, proposed_methods) in &proposed_paths {
         let code_methods = code_paths.get(path);
-        for (method, prop_op) in proposed_methods {
+        for (method, prop_op_raw) in proposed_methods {
             let endpoint = endpoint_label(method, path);
-            let actual_op = code_methods.and_then(|m| m.get(method));
-            match actual_op {
+            let actual_op_raw = code_methods.and_then(|m| m.get(method));
+            match actual_op_raw {
                 None => out.push(DriftFinding {
                     kind: "endpoint_missing_in_code",
                     endpoint,
@@ -124,11 +137,14 @@ pub fn diff(proposal: &YamlValue, code: &JsonValue) -> Vec<DriftFinding> {
                     actual: None,
                 }),
                 Some(actual) => {
-                    diff_response_statuses(&endpoint, prop_op, actual, &mut out);
+                    let prop_view = OperationView::from(prop_op_raw, proposal_components);
+                    let actual_view = OperationView::from(actual, code_components);
+                    diff_response_statuses(&endpoint, &prop_view, &actual_view, &mut out);
+                    diff_request_required(&endpoint, &prop_view, &actual_view, &mut out);
+                    diff_parameters(&endpoint, &prop_view, &actual_view, &mut out);
                 }
             }
         }
-        // Methods on this path in code that the proposal didn't declare.
         if let Some(code_methods) = code_methods {
             for (method, _) in code_methods {
                 if !proposed_methods.contains_key(method) {
@@ -147,11 +163,11 @@ pub fn diff(proposal: &YamlValue, code: &JsonValue) -> Vec<DriftFinding> {
 
 fn diff_response_statuses(
     endpoint: &str,
-    proposed_op: &OperationView,
-    actual_op: &OperationView,
+    p: &OperationView,
+    a: &OperationView,
     out: &mut Vec<DriftFinding>,
 ) {
-    for status in proposed_op.response_codes.difference(&actual_op.response_codes) {
+    for status in p.response_codes.difference(&a.response_codes) {
         out.push(DriftFinding {
             kind: "response_status_missing_in_code",
             endpoint: endpoint.to_string(),
@@ -159,13 +175,75 @@ fn diff_response_statuses(
             actual: None,
         });
     }
-    for status in actual_op.response_codes.difference(&proposed_op.response_codes) {
+    for status in a.response_codes.difference(&p.response_codes) {
         out.push(DriftFinding {
             kind: "response_status_added_in_code",
             endpoint: endpoint.to_string(),
             proposed: None,
             actual: Some(JsonValue::String(status.clone())),
         });
+    }
+}
+
+fn diff_request_required(
+    endpoint: &str,
+    p: &OperationView,
+    a: &OperationView,
+    out: &mut Vec<DriftFinding>,
+) {
+    for field in p.request_required.difference(&a.request_required) {
+        out.push(DriftFinding {
+            kind: "request_required_field_missing_in_code",
+            endpoint: endpoint.to_string(),
+            proposed: Some(JsonValue::String(field.clone())),
+            actual: None,
+        });
+    }
+    for field in a.request_required.difference(&p.request_required) {
+        out.push(DriftFinding {
+            kind: "request_required_field_added_in_code",
+            endpoint: endpoint.to_string(),
+            proposed: None,
+            actual: Some(JsonValue::String(field.clone())),
+        });
+    }
+}
+
+fn diff_parameters(
+    endpoint: &str,
+    p: &OperationView,
+    a: &OperationView,
+    out: &mut Vec<DriftFinding>,
+) {
+    let p_keys: BTreeSet<_> = p.parameters.keys().collect();
+    let a_keys: BTreeSet<_> = a.parameters.keys().collect();
+    for key in p_keys.difference(&a_keys) {
+        out.push(DriftFinding {
+            kind: "parameter_missing_in_code",
+            endpoint: endpoint.to_string(),
+            proposed: Some(json!({"name": key.0, "in": key.1})),
+            actual: None,
+        });
+    }
+    for key in a_keys.difference(&p_keys) {
+        out.push(DriftFinding {
+            kind: "parameter_added_in_code",
+            endpoint: endpoint.to_string(),
+            proposed: None,
+            actual: Some(json!({"name": key.0, "in": key.1})),
+        });
+    }
+    for key in p_keys.intersection(&a_keys) {
+        let pr = p.parameters[*key];
+        let ar = a.parameters[*key];
+        if pr != ar {
+            out.push(DriftFinding {
+                kind: "parameter_required_changed",
+                endpoint: endpoint.to_string(),
+                proposed: Some(json!({"name": key.0, "in": key.1, "required": pr})),
+                actual: Some(json!({"name": key.0, "in": key.1, "required": ar})),
+            });
+        }
     }
 }
 
@@ -176,70 +254,42 @@ fn endpoint_label(method: &str, path: &str) -> String {
 #[derive(Debug, Clone)]
 struct OperationView {
     response_codes: BTreeSet<String>,
+    /// Required fields drawn from the request body schema (set-union over
+    /// content-types; resolves `$ref` and `allOf`).
+    request_required: BTreeSet<String>,
+    /// `(name, in)` → `required: bool` over declared parameters (resolves
+    /// `$ref` to `#/components/parameters/<Name>`).
+    parameters: BTreeMap<(String, String), bool>,
 }
 
-fn empty_operation() -> OperationView {
-    OperationView {
-        response_codes: BTreeSet::new(),
-    }
-}
-
-fn paths_from_yaml(v: &YamlValue) -> BTreeMap<String, BTreeMap<String, OperationView>> {
-    let mut out = BTreeMap::new();
-    let paths = match v.get("paths") {
-        Some(YamlValue::Mapping(m)) => m,
-        _ => return out,
-    };
-    for (path_key, path_item) in paths {
-        let path = match path_key.as_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let item_map = match path_item {
-            YamlValue::Mapping(m) => m,
-            _ => continue,
-        };
-        let mut methods: BTreeMap<String, OperationView> = BTreeMap::new();
-        for (op_k, op_v) in item_map {
-            let method = match op_k.as_str() {
-                Some(s) => s,
-                None => continue,
-            };
-            if !HTTP_METHODS.contains(&method) {
-                continue;
-            }
-            let view = OperationView {
-                response_codes: yaml_response_codes(op_v),
-            };
-            methods.insert(method.to_string(), view);
-        }
-        if !methods.is_empty() {
-            out.insert(path, methods);
+impl OperationView {
+    fn from(op: &JsonValue, components: Option<&JsonValue>) -> Self {
+        OperationView {
+            response_codes: response_codes(op),
+            request_required: request_required_fields(op, components),
+            parameters: parameters_for(op, components),
         }
     }
-    out
 }
 
-fn paths_from_json(v: &JsonValue) -> BTreeMap<String, BTreeMap<String, OperationView>> {
-    let mut out = BTreeMap::new();
-    let paths = match v.get("paths").and_then(|p| p.as_object()) {
-        Some(p) => p,
-        None => return out,
+/// Convert either YAML mapping or JSON object into a path → method →
+/// operation-Value tree. The serde_json::Value comes from either smartdoc
+/// (already JSON) or the proposal (converted via `serde_json::to_value`).
+fn paths_from(v: &JsonValue) -> BTreeMap<String, BTreeMap<String, JsonValue>> {
+    let mut out: BTreeMap<String, BTreeMap<String, JsonValue>> = BTreeMap::new();
+    let Some(paths) = v.get("paths").and_then(|p| p.as_object()) else {
+        return out;
     };
-    for (path, path_item) in paths {
-        let item_map = match path_item.as_object() {
-            Some(m) => m,
-            None => continue,
+    for (path, item) in paths {
+        let Some(item_map) = item.as_object() else {
+            continue;
         };
-        let mut methods: BTreeMap<String, OperationView> = BTreeMap::new();
+        let mut methods: BTreeMap<String, JsonValue> = BTreeMap::new();
         for (op_k, op_v) in item_map {
             if !HTTP_METHODS.contains(&op_k.as_str()) {
                 continue;
             }
-            let view = OperationView {
-                response_codes: json_response_codes(op_v),
-            };
-            methods.insert(op_k.clone(), view);
+            methods.insert(op_k.clone(), op_v.clone());
         }
         if !methods.is_empty() {
             out.insert(path.clone(), methods);
@@ -248,39 +298,127 @@ fn paths_from_json(v: &JsonValue) -> BTreeMap<String, BTreeMap<String, Operation
     out
 }
 
-fn yaml_response_codes(op: &YamlValue) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let responses = match op.get("responses") {
-        Some(YamlValue::Mapping(m)) => m,
-        _ => return out,
-    };
-    for (k, _) in responses {
-        if let Some(s) = k.as_str() {
-            out.insert(s.to_string());
-        } else if let Some(n) = k.as_i64() {
-            out.insert(n.to_string());
-        }
-    }
-    out
-}
-
-fn json_response_codes(op: &JsonValue) -> BTreeSet<String> {
+fn response_codes(op: &JsonValue) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let Some(map) = op.get("responses").and_then(|r| r.as_object()) else {
         return out;
     };
-    for (k, _) in map {
+    for k in map.keys() {
         out.insert(k.clone());
     }
     out
 }
 
-/// Suppress unused warnings for the empty-operation helper kept for the
-/// later schema-diff slice.
-#[allow(dead_code)]
-fn _touch_helpers() {
-    let _ = empty_operation();
-    let _ = Map::<String, JsonValue>::new();
+/// Walk `operation.requestBody.content.<media>.schema` for each content
+/// type, follow `$ref` into `components.schemas`, recurse into `allOf`,
+/// union the `required: [...]` arrays. `oneOf`/`anyOf` are skipped — their
+/// requireds are conditional, not absolute.
+fn request_required_fields(op: &JsonValue, components: Option<&JsonValue>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(body) = op.get("requestBody") else {
+        return out;
+    };
+    // A requestBody may itself be a $ref to components.requestBodies.
+    let body = resolve_ref(body, components, "requestBodies").unwrap_or(body.clone());
+    let Some(content) = body.get("content").and_then(|c| c.as_object()) else {
+        return out;
+    };
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    for (_mt, media) in content {
+        if let Some(schema) = media.get("schema") {
+            collect_required(schema, components, &mut out, &mut visited);
+        }
+    }
+    out
+}
+
+fn collect_required(
+    schema: &JsonValue,
+    components: Option<&JsonValue>,
+    out: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) {
+    // Resolve $ref first.
+    if let Some(reference) = schema.get("$ref").and_then(|r| r.as_str()) {
+        if !visited.insert(reference.to_string()) {
+            return;
+        }
+        if let Some(target) = resolve_components_path(reference, components) {
+            collect_required(&target, components, out, visited);
+        }
+        return;
+    }
+    if let Some(arr) = schema.get("required").and_then(|r| r.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                out.insert(s.to_string());
+            }
+        }
+    }
+    if let Some(all_of) = schema.get("allOf").and_then(|a| a.as_array()) {
+        for branch in all_of {
+            collect_required(branch, components, out, visited);
+        }
+    }
+}
+
+/// `(name, in)` → `required` for declared parameters. Resolves
+/// `$ref` to `#/components/parameters/<Name>`. `path` parameters are
+/// implicitly `required: true` per OpenAPI 3.x — coerced here.
+fn parameters_for(
+    op: &JsonValue,
+    components: Option<&JsonValue>,
+) -> BTreeMap<(String, String), bool> {
+    let mut out = BTreeMap::new();
+    let Some(arr) = op.get("parameters").and_then(|p| p.as_array()) else {
+        return out;
+    };
+    for p in arr {
+        let resolved = resolve_ref(p, components, "parameters").unwrap_or_else(|| p.clone());
+        let name = resolved
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(str::to_string);
+        let in_ = resolved
+            .get("in")
+            .and_then(|n| n.as_str())
+            .map(str::to_string);
+        let required = match resolved.get("required") {
+            Some(JsonValue::Bool(b)) => *b,
+            _ => false,
+        };
+        if let (Some(n), Some(i)) = (name, in_) {
+            // OpenAPI 3.x: path parameters MUST be required.
+            let required = required || i == "path";
+            out.insert((n, i), required);
+        }
+    }
+    out
+}
+
+/// If `node` is a `{$ref: "#/components/<bucket>/<Name>"}`, resolve it.
+/// Returns `None` for non-ref nodes; resolution failure also returns `None`
+/// so the caller can fall through to its inline-shape branch.
+fn resolve_ref(
+    node: &JsonValue,
+    components: Option<&JsonValue>,
+    bucket: &str,
+) -> Option<JsonValue> {
+    let reference = node.get("$ref")?.as_str()?;
+    let prefix = format!("#/components/{bucket}/");
+    let name = reference.strip_prefix(&prefix)?;
+    let comp = components?.get(bucket)?.as_object()?;
+    comp.get(name).cloned()
+}
+
+/// Resolve a `#/components/<bucket>/<Name>` $ref string regardless of bucket
+/// (used for nested schema $refs whose bucket name is fixed).
+fn resolve_components_path(reference: &str, components: Option<&JsonValue>) -> Option<JsonValue> {
+    let rest = reference.strip_prefix("#/components/")?;
+    let mut parts = rest.splitn(2, '/');
+    let bucket = parts.next()?;
+    let name = parts.next()?;
+    components?.get(bucket)?.get(name).cloned()
 }
 
 #[cfg(test)]
@@ -327,7 +465,9 @@ paths:
         );
         let code = json(r#"{"paths":{"/a":{"get":{"responses":{"200":{"description":"ok"}}}}}}"#);
         let d = diff(&proposal, &code);
-        assert!(d.iter().any(|f| f.kind == "endpoint_missing_in_code" && f.endpoint == "POST /a"));
+        assert!(d
+            .iter()
+            .any(|f| f.kind == "endpoint_missing_in_code" && f.endpoint == "POST /a"));
     }
 
     #[test]
@@ -349,7 +489,9 @@ paths:
             }}}"#,
         );
         let d = diff(&proposal, &code);
-        assert!(d.iter().any(|f| f.kind == "endpoint_added_in_code" && f.endpoint == "GET /a"));
+        assert!(d
+            .iter()
+            .any(|f| f.kind == "endpoint_added_in_code" && f.endpoint == "GET /a"));
     }
 
     #[test]
@@ -372,13 +514,11 @@ paths:
             }}}}}"#,
         );
         let d = diff(&proposal, &code);
-        // 409 is in proposal but not code
         assert!(d
             .iter()
             .any(|f| f.kind == "response_status_missing_in_code"
                 && f.endpoint == "POST /a"
                 && f.proposed == Some(JsonValue::String("409".into()))));
-        // 200 is in code but not proposal
         assert!(d
             .iter()
             .any(|f| f.kind == "response_status_added_in_code"
@@ -388,8 +528,6 @@ paths:
 
     #[test]
     fn untouched_paths_in_code_do_not_drift() {
-        // Proposal touches /a only. Code also has /b. /b should NOT appear
-        // in drift — the proposal explicitly only declares paths it changes.
         let proposal = yaml(
             r#"openapi: 3.0.3
 info: {title: x, version: '1'}
@@ -422,8 +560,222 @@ components:
         );
         let code = json(r#"{"paths":{"/a":{"get":{"responses":{"200":{"description":"ok"}}}}}}"#);
         let d = diff(&proposal, &code);
-        // schema-level diffs aren't implemented this slice; paths-only diff
-        // sees no proposed paths → no drift.
         assert!(d.is_empty(), "got: {:?}", d);
+    }
+
+    // --- Schema-level diffs ---
+
+    #[test]
+    fn request_required_field_added_in_code() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customerId]
+      responses:
+        '201': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"post":{
+                "requestBody":{"content":{"application/json":{"schema":{
+                    "type":"object",
+                    "required":["customerId","amount"]
+                }}}},
+                "responses":{"201":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        assert!(d.iter().any(|f| f.kind == "request_required_field_added_in_code"
+            && f.actual == Some(JsonValue::String("amount".into()))));
+        assert!(!d
+            .iter()
+            .any(|f| f.kind == "request_required_field_missing_in_code"));
+    }
+
+    #[test]
+    fn request_required_resolves_ref_to_components_schemas() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateInvoice'}
+      responses:
+        '201': {description: ok}
+components:
+  schemas:
+    CreateInvoice:
+      type: object
+      required: [customerId, amount]
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"post":{
+                "requestBody":{"content":{"application/json":{"schema":{
+                    "type":"object","required":["customerId"]
+                }}}},
+                "responses":{"201":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        // Proposal: {customerId, amount}; code: {customerId} → amount missing in code.
+        assert!(d.iter().any(|f| f.kind == "request_required_field_missing_in_code"
+            && f.proposed == Some(JsonValue::String("amount".into()))));
+    }
+
+    #[test]
+    fn request_required_unions_allof_branches() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Base'
+                - type: object
+                  required: [extra]
+      responses:
+        '201': {description: ok}
+components:
+  schemas:
+    Base:
+      type: object
+      required: [baseId]
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"post":{
+                "requestBody":{"content":{"application/json":{"schema":{
+                    "type":"object","required":["baseId"]
+                }}}},
+                "responses":{"201":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        assert!(d.iter().any(|f| f.kind == "request_required_field_missing_in_code"
+            && f.proposed == Some(JsonValue::String("extra".into()))));
+    }
+
+    #[test]
+    fn parameter_added_in_code() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      parameters:
+        - {name: page, in: query, required: true}
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{
+                "parameters":[
+                    {"name":"page","in":"query","required":true},
+                    {"name":"size","in":"query","required":false}
+                ],
+                "responses":{"200":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        assert!(d.iter().any(|f| f.kind == "parameter_added_in_code"
+            && f.actual == Some(json!({"name":"size","in":"query"}))));
+    }
+
+    #[test]
+    fn parameter_missing_in_code() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      parameters:
+        - {name: page, in: query, required: true}
+        - {name: size, in: query, required: false}
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{
+                "parameters":[{"name":"page","in":"query","required":true}],
+                "responses":{"200":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        assert!(d.iter().any(|f| f.kind == "parameter_missing_in_code"
+            && f.proposed == Some(json!({"name":"size","in":"query"}))));
+    }
+
+    #[test]
+    fn parameter_required_flag_change() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      parameters:
+        - {name: page, in: query, required: true}
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{
+                "parameters":[{"name":"page","in":"query","required":false}],
+                "responses":{"200":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        assert!(d
+            .iter()
+            .any(|f| f.kind == "parameter_required_changed" && f.endpoint == "GET /a"));
+    }
+
+    #[test]
+    fn path_parameters_treated_as_required_implicitly() {
+        // OpenAPI 3.x: path parameters are required by spec. If the proposal
+        // omits the `required: true` field but the code emits it, that's NOT
+        // drift — both are required.
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a/{id}:
+    get:
+      parameters:
+        - {name: id, in: path}
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a/{id}":{"get":{
+                "parameters":[{"name":"id","in":"path","required":true}],
+                "responses":{"200":{"description":"ok"}}
+            }}}}"#,
+        );
+        assert!(diff(&proposal, &code).is_empty());
     }
 }
