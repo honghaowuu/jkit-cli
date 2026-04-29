@@ -14,6 +14,7 @@ use std::path::Path;
 use crate::domains::yaml::{
     DomainsFile, LoadError, DESCRIPTION_MAX, FILE_RELATIVE, USE_WHEN_MAX,
 };
+use crate::scenarios_yaml::{ScenariosFile, FILE_RELATIVE as SCENARIOS_RELATIVE};
 use crate::util::print_json;
 
 #[derive(Serialize)]
@@ -86,6 +87,40 @@ pub fn diagnose(project_root: &Path) -> Result<DoctorReport> {
                 "Run `jkit domains add --slug <s> --description <d> --use-when <w>` to seed it."
             ),
         });
+    }
+
+    let domain_slugs: std::collections::HashSet<String> =
+        entries.iter().map(|(s, _)| s.clone()).collect();
+    let scenarios = ScenariosFile::load(project_root)?;
+    for slug in scenarios.slugs() {
+        if !domain_slugs.contains(&slug) {
+            findings.push(Finding {
+                code: "scenarios_slug_not_in_domains",
+                severity: "issue",
+                message: format!(
+                    "{SCENARIOS_RELATIVE} references domain `{slug}` but it is not in {FILE_RELATIVE}."
+                ),
+                remediation: format!(
+                    "Either run `jkit domains add --slug {slug} --description <d> --use-when <w>` or remove the entry from {SCENARIOS_RELATIVE}."
+                ),
+            });
+        }
+    }
+    let scenario_slugs: std::collections::HashSet<String> =
+        scenarios.slugs().into_iter().collect();
+    for slug in domain_slugs.iter() {
+        if !scenario_slugs.contains(slug) {
+            findings.push(Finding {
+                code: "domain_missing_in_scenarios",
+                severity: "warning",
+                message: format!(
+                    "domain `{slug}` is in {FILE_RELATIVE} but has no entry in {SCENARIOS_RELATIVE}."
+                ),
+                remediation: format!(
+                    "Re-run `jkit domains add --slug {slug} --description <d> --use-when <w>` to seed an empty entry, or add scenarios manually."
+                ),
+            });
+        }
     }
 
     for (slug, entry) in entries {
@@ -227,6 +262,42 @@ mod tests {
         assert!(r.clean);
         assert!(r.findings.iter().any(|f| f.code == "description_too_long"));
         assert!(r.findings.iter().any(|f| f.code == "use_when_too_long"));
+    }
+
+    #[test]
+    fn scenarios_slug_not_in_domains_is_issue() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join("docs/domains.yaml"),
+            "domains:\n  billing:\n    description: a\n    use_when: b\n",
+        );
+        write(
+            &tmp.path().join("docs/test-scenarios.yaml"),
+            "domains:\n  payment: []\n  billing: []\n",
+        );
+        let r = diagnose(tmp.path()).unwrap();
+        assert!(!r.clean);
+        assert!(r
+            .findings
+            .iter()
+            .any(|f| f.code == "scenarios_slug_not_in_domains"
+                && f.message.contains("payment")));
+    }
+
+    #[test]
+    fn domain_missing_in_scenarios_is_warning() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join("docs/domains.yaml"),
+            "domains:\n  billing:\n    description: a\n    use_when: b\n",
+        );
+        // No test-scenarios.yaml at all.
+        let r = diagnose(tmp.path()).unwrap();
+        assert!(r.clean); // warning not issue
+        assert!(r
+            .findings
+            .iter()
+            .any(|f| f.code == "domain_missing_in_scenarios"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::domains::yaml::{DomainEntry, DomainsFile};
 use crate::envelope;
+use crate::scenarios_yaml::ScenariosFile;
 use crate::util::print_json;
 
 #[derive(Serialize)]
@@ -13,6 +14,9 @@ pub struct DomainsAddReport {
     pub created: bool,
     pub description: String,
     pub use_when: String,
+    /// True when this run created the empty `domains.<slug>: []` skeleton in
+    /// `docs/test-scenarios.yaml`. False when the entry was already present.
+    pub scenarios_seeded: bool,
 }
 
 pub fn run(slug: &str, description: &str, use_when: &str) -> Result<()> {
@@ -53,30 +57,44 @@ pub fn perform(
     use_when: &str,
 ) -> Result<AddOutcome> {
     let mut file = DomainsFile::load(project_root)?;
-    if let Some(existing) = file.get(slug) {
+    let already_present = file.get(slug);
+    if let Some(existing) = &already_present {
         let same_desc = existing.description.as_deref() == Some(description);
         let same_uw = existing.use_when.as_deref() == Some(use_when);
-        if same_desc && same_uw {
-            return Ok(AddOutcome::Ok(DomainsAddReport {
-                slug: slug.to_string(),
-                created: false,
-                description: description.to_string(),
-                use_when: use_when.to_string(),
-            }));
+        if !(same_desc && same_uw) {
+            return Ok(AddOutcome::Collision {
+                existing_description: existing.description.clone(),
+                existing_use_when: existing.use_when.clone(),
+            });
         }
-        return Ok(AddOutcome::Collision {
-            existing_description: existing.description,
-            existing_use_when: existing.use_when,
-        });
     }
-    file.upsert(slug, DomainEntry::new(description, use_when));
-    file.save()?;
+    let domains_changed = already_present.is_none();
+    if domains_changed {
+        file.upsert(slug, DomainEntry::new(description, use_when));
+        file.save()?;
+    }
+    let scenarios_seeded = seed_scenarios_skeleton(project_root, slug)?;
     Ok(AddOutcome::Ok(DomainsAddReport {
         slug: slug.to_string(),
-        created: true,
+        created: domains_changed,
         description: description.to_string(),
         use_when: use_when.to_string(),
+        scenarios_seeded,
     }))
+}
+
+/// Idempotent: ensure `docs/test-scenarios.yaml` has a `domains.<slug>` key
+/// (empty flat list if absent). Returns `true` when this call created the
+/// entry, `false` when it was already present.
+fn seed_scenarios_skeleton(project_root: &Path, slug: &str) -> Result<bool> {
+    let mut file = ScenariosFile::load(project_root)?;
+    let already = file.slugs().iter().any(|s| s == slug);
+    if already {
+        return Ok(false);
+    }
+    file.ensure_slug_seeded(slug);
+    file.save()?;
+    Ok(true)
 }
 
 fn validate_slug(slug: &str) -> Result<(), String> {
@@ -106,14 +124,33 @@ mod tests {
     fn perform_creates_then_idempotent_replays() {
         let tmp = tempdir().unwrap();
         match perform(tmp.path(), "billing", "invoices", "for invoicing").unwrap() {
-            AddOutcome::Ok(r) => assert!(r.created),
+            AddOutcome::Ok(r) => {
+                assert!(r.created);
+                assert!(r.scenarios_seeded);
+            }
             _ => panic!(),
         }
-        // Same args → idempotent, created=false.
+        // Same args → idempotent, created=false, scenarios already seeded.
         match perform(tmp.path(), "billing", "invoices", "for invoicing").unwrap() {
-            AddOutcome::Ok(r) => assert!(!r.created),
+            AddOutcome::Ok(r) => {
+                assert!(!r.created);
+                assert!(!r.scenarios_seeded);
+            }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn perform_seeds_test_scenarios_skeleton() {
+        let tmp = tempdir().unwrap();
+        match perform(tmp.path(), "billing", "invoices", "for invoicing").unwrap() {
+            AddOutcome::Ok(r) => assert!(r.scenarios_seeded),
+            _ => panic!(),
+        }
+        let scen = tmp.path().join("docs/test-scenarios.yaml");
+        assert!(scen.exists());
+        let text = std::fs::read_to_string(&scen).unwrap();
+        assert!(text.contains("billing"));
     }
 
     #[test]

@@ -60,10 +60,9 @@ fn generate(cwd: &Path, args: SummaryArgs) -> Result<SummaryReport> {
         .clone()
         .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
 
-    let domains_root = cwd.join("docs/domains");
     let domain_list = match args.domains.as_ref() {
         Some(d) => d.clone(),
-        None => list_domain_subdirs(&domains_root)?,
+        None => list_domains_from_yaml(cwd)?,
     };
     let test_root = if args.test_root.is_absolute() {
         args.test_root.clone()
@@ -73,7 +72,7 @@ fn generate(cwd: &Path, args: SummaryArgs) -> Result<SummaryReport> {
     let counts = if domain_list.is_empty() {
         Vec::new()
     } else {
-        gap::count_gaps_per_domain(&domains_root, &domain_list, &test_root)?
+        gap::count_gaps_per_domain(cwd, &domain_list, &test_root)?
     };
     let gap_total: u32 = counts.iter().map(|(_, c)| *c as u32).sum();
     let gap_domains: u32 = counts.iter().filter(|(_, c)| *c > 0).count() as u32;
@@ -99,18 +98,14 @@ fn generate(cwd: &Path, args: SummaryArgs) -> Result<SummaryReport> {
     })
 }
 
-fn list_domain_subdirs(domains_root: &Path) -> Result<Vec<String>> {
-    if !domains_root.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut out: Vec<String> = fs::read_dir(domains_root)
-        .with_context(|| format!("reading {}", domains_root.display()))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    out.sort();
-    Ok(out)
+/// Fallback domain list when `--domains` isn't passed: read slugs from
+/// `docs/domains.yaml`. Returns an empty Vec when the file is absent so that
+/// fresh projects don't error out.
+fn list_domains_from_yaml(project_root: &Path) -> Result<Vec<String>> {
+    let report = crate::domains::list::collect(project_root)?;
+    let mut slugs: Vec<String> = report.domains.into_iter().map(|d| d.slug).collect();
+    slugs.sort();
+    Ok(slugs)
 }
 
 fn render_markdown(
@@ -177,13 +172,20 @@ mod tests {
         let run = setup_run(tmp.path(), "a.md\nb.md\n");
         write_yaml(
             tmp.path(),
-            "docs/domains/billing/test-scenarios.yaml",
-            "- endpoint: POST /x\n  id: a-b\n  description: foo\n- endpoint: POST /x\n  id: c-d\n  description: bar\n",
-        );
-        write_yaml(
-            tmp.path(),
-            "docs/domains/inventory/test-scenarios.yaml",
-            "- endpoint: GET /y\n  id: e-f\n  description: baz\n",
+            "docs/test-scenarios.yaml",
+            r#"domains:
+  billing:
+    - endpoint: POST /x
+      id: a-b
+      description: foo
+    - endpoint: POST /x
+      id: c-d
+      description: bar
+  inventory:
+    - endpoint: GET /y
+      id: e-f
+      description: baz
+"#,
         );
         let report = generate(
             tmp.path(),
@@ -206,8 +208,16 @@ mod tests {
         setup_run(tmp.path(), "a.md\n");
         write_yaml(
             tmp.path(),
-            "docs/domains/billing/test-scenarios.yaml",
-            "- endpoint: POST /x\n  id: a-b\n  description: foo\n- endpoint: POST /x\n  id: c-d\n  description: bar\n",
+            "docs/test-scenarios.yaml",
+            r#"domains:
+  billing:
+    - endpoint: POST /x
+      id: a-b
+      description: foo
+    - endpoint: POST /x
+      id: c-d
+      description: bar
+"#,
         );
         write_yaml(
             tmp.path(),
@@ -237,8 +247,19 @@ mod tests {
         setup_run(tmp.path(), "a.md\n");
         write_yaml(
             tmp.path(),
-            "docs/domains/billing/test-scenarios.yaml",
-            "- endpoint: POST /x\n  id: a-b\n  description: foo\n- endpoint: POST /x\n  id: c-d\n  description: bar\n- endpoint: POST /x\n  id: e-f\n  description: baz\n",
+            "docs/test-scenarios.yaml",
+            r#"domains:
+  billing:
+    - endpoint: POST /x
+      id: a-b
+      description: foo
+    - endpoint: POST /x
+      id: c-d
+      description: bar
+    - endpoint: POST /x
+      id: e-f
+      description: baz
+"#,
         );
         generate(tmp.path(), args(Some(vec!["billing".into()]))).unwrap();
         let body =
@@ -247,18 +268,34 @@ mod tests {
     }
 
     #[test]
-    fn no_domains_arg_falls_back_to_scanning_all_domain_subdirs() {
+    fn no_domains_arg_falls_back_to_domains_yaml_slugs() {
         let tmp = tempdir().unwrap();
         setup_run(tmp.path(), "a.md\n");
         write_yaml(
             tmp.path(),
-            "docs/domains/billing/test-scenarios.yaml",
-            "- endpoint: GET /x\n  id: a-b\n  description: foo\n",
+            "docs/domains.yaml",
+            r#"domains:
+  billing:
+    description: invoices
+    use_when: for invoicing
+  inventory:
+    description: catalog
+    use_when: for catalog
+"#,
         );
         write_yaml(
             tmp.path(),
-            "docs/domains/inventory/test-scenarios.yaml",
-            "- endpoint: GET /y\n  id: c-d\n  description: bar\n",
+            "docs/test-scenarios.yaml",
+            r#"domains:
+  billing:
+    - endpoint: GET /x
+      id: a-b
+      description: foo
+  inventory:
+    - endpoint: GET /y
+      id: c-d
+      description: bar
+"#,
         );
         let report = generate(tmp.path(), args(None)).unwrap();
         assert_eq!(report.gap_total, 2);

@@ -1,39 +1,25 @@
 use anyhow::{Context, Result};
-use heck::{ToPascalCase, ToLowerCamelCase};
+use heck::{ToLowerCamelCase, ToPascalCase};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::domain_layout::{self, ApiType, DetectedLayout};
+use crate::scenarios_yaml::ScenariosFile;
 use crate::util::print_json;
-
-/// Canonical test-scenarios.yaml format: top-level sequence of
-/// `{endpoint, id, description}` entries — same shape `kit scenarios sync`
-/// writes and `jkit migrate scaffold-docs` produces. Older nested formats
-/// (`Vec<EndpointGroup>` with grouped scenarios) are no longer recognized;
-/// projects on the legacy format need to flatten manually or re-run sync.
-#[derive(Debug, Deserialize, Clone)]
-struct ScenarioEntry {
-    endpoint: String,
-    id: String,
-    description: String,
-}
 
 #[derive(Debug, Serialize)]
 struct GapEntrySingle {
     endpoint: String,
     id: String,
     description: String,
-    /// `Some(api_type)` when the gap came from a per-type
-    /// `test-scenarios.yaml` under `docs/domains/<slug>/<api-type>/`.
-    /// `None` for flat (single-type) layouts where there's no
-    /// disambiguation to record.
+    /// `Some(api_type)` when the gap came from `domains.<slug>.<api-type>`;
+    /// `None` for flat (single-type) layouts.
     #[serde(skip_serializing_if = "Option::is_none")]
-    api_type: Option<ApiType>,
+    api_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,13 +31,12 @@ struct GapEntryAggregated {
     test_class_path: Option<String>,
     test_method_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    api_type: Option<ApiType>,
+    api_type: Option<String>,
 }
 
 /// `kit scenarios skip` writes a flat JSON array of records;
-/// older designs used an envelope `{ "skipped": [...] }`. Accept both
-/// transparently — the reader is the cheaper side to keep flexible.
-#[derive(Debug, Deserialize)]
+/// older designs used an envelope `{ "skipped": [...] }`. Accept both.
+#[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 enum SkippedScenarios {
     Envelope { skipped: Vec<SkippedEntry> },
@@ -67,7 +52,7 @@ impl SkippedScenarios {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct SkippedEntry {
     domain: String,
     endpoint: String,
@@ -80,52 +65,25 @@ pub fn run(
     test_root: &Path,
     pom_path: &Path,
 ) -> Result<()> {
+    let cwd = std::env::current_dir().context("reading cwd")?;
     if let Some(run_dir) = run_dir {
-        run_aggregated(run_dir, test_root, pom_path)
+        run_aggregated(&cwd, run_dir, test_root, pom_path)
     } else if let Some(d) = domain {
-        run_single(d, test_root)
+        run_single(&cwd, d, test_root)
     } else {
         anyhow::bail!("either <domain> or --run <dir> must be supplied");
     }
 }
 
-fn run_single(domain: &str, test_root: &Path) -> Result<()> {
-    let domains_root = PathBuf::from("docs/domains");
-    let layout = domain_layout::detect_layout(&domains_root, domain);
-
-    // Resolve which test-scenarios.yaml file(s) to read. Multi-type domains
-    // have one per api_type; single-type stays at the slug root.
-    let buckets: Vec<(Option<ApiType>, PathBuf)> = match &layout {
-        DetectedLayout::MultiType(types) => types
-            .iter()
-            .map(|ty| {
-                (
-                    Some(*ty),
-                    domains_root
-                        .join(domain)
-                        .join(ty.dir_name())
-                        .join("test-scenarios.yaml"),
-                )
-            })
-            .collect(),
-        _ => vec![(None, domains_root.join(domain).join("test-scenarios.yaml"))],
-    };
-
+fn run_single(project_root: &Path, domain: &str, test_root: &Path) -> Result<()> {
+    let file = ScenariosFile::load(project_root)?;
+    let section = file.section(domain)?;
     let implemented = implemented_method_names(test_root)?;
-    // Per-domain mode: union skip records from any archived `.jkit/done/<*>/`
-    // run dir. Active run dirs are only relevant for `--run` mode (handled by
-    // run_aggregated). Without this, scenarios already explicitly skipped in a
-    // prior pipeline run reappear as gaps in /post-edit's per-domain query.
-    let skipped = load_skip_records(&archived_run_dirs())?;
+    let skipped = load_skip_records(&archived_run_dirs(project_root))?;
 
     let mut out: Vec<GapEntrySingle> = Vec::new();
-
-    for (api_type, yaml_path) in &buckets {
-        if !yaml_path.exists() {
-            continue;
-        }
-        let entries = load_scenarios(yaml_path)?;
-        for e in &entries {
+    if let Some(section) = section {
+        for (api_type, e) in section.iter_with_type() {
             let camel = id_to_camel(&e.id);
             if implemented.contains(&camel) {
                 continue;
@@ -138,7 +96,59 @@ fn run_single(domain: &str, test_root: &Path) -> Result<()> {
                 endpoint: e.endpoint.clone(),
                 id: e.id.clone(),
                 description: e.description.clone(),
-                api_type: *api_type,
+                api_type: api_type.map(str::to_string),
+            });
+        }
+    }
+    print_json(&serde_json::json!({ "gaps": out }))
+}
+
+fn run_aggregated(
+    project_root: &Path,
+    run_dir: &Path,
+    test_root: &Path,
+    pom_path: &Path,
+) -> Result<()> {
+    let cs_path = run_dir.join("change-summary.md");
+    if !cs_path.exists() {
+        anyhow::bail!("change-summary.md missing in {}", run_dir.display());
+    }
+    let cs_text =
+        fs::read_to_string(&cs_path).with_context(|| format!("reading {}", cs_path.display()))?;
+    let domains = parse_affected_domains(&cs_text)
+        .ok_or_else(|| anyhow::anyhow!("change-summary.md: '## Domains Changed' section not found"))?;
+
+    let skipped: HashSet<(String, String, String)> =
+        load_skip_records(&[run_dir.to_path_buf()])?;
+
+    let implemented = implemented_method_names(test_root)?;
+    let pom_meta = read_pom_coords(pom_path).ok();
+
+    let file = ScenariosFile::load(project_root)?;
+    let mut out: Vec<GapEntryAggregated> = Vec::new();
+    for domain in &domains {
+        let section = match file.section(domain)? {
+            Some(s) => s,
+            None => continue,
+        };
+        for (api_type, e) in section.iter_with_type() {
+            let camel = id_to_camel(&e.id);
+            if implemented.contains(&camel) {
+                continue;
+            }
+            let key = (domain.clone(), e.endpoint.clone(), e.id.clone());
+            if skipped.contains(&key) {
+                continue;
+            }
+            let test_class_path = resolve_test_class_path(test_root, domain, pom_meta.as_ref());
+            out.push(GapEntryAggregated {
+                domain: domain.clone(),
+                endpoint: e.endpoint.clone(),
+                id: e.id.clone(),
+                description: e.description.clone(),
+                test_class_path,
+                test_method_name: camel,
+                api_type: api_type.map(str::to_string),
             });
         }
     }
@@ -146,8 +156,7 @@ fn run_single(domain: &str, test_root: &Path) -> Result<()> {
 }
 
 /// Load + union skip records from each given run directory's
-/// `skipped-scenarios.json`. Tolerates both the envelope and flat array
-/// formats (see `SkippedScenarios`).
+/// `skipped-scenarios.json`. Tolerates both envelope and flat-array shapes.
 fn load_skip_records(run_dirs: &[PathBuf]) -> Result<HashSet<(String, String, String)>> {
     let mut set: HashSet<(String, String, String)> = HashSet::new();
     for run in run_dirs {
@@ -156,8 +165,8 @@ fn load_skip_records(run_dirs: &[PathBuf]) -> Result<HashSet<(String, String, St
             continue;
         }
         let text = fs::read_to_string(&p)?;
-        let s: SkippedScenarios = serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", p.display()))?;
+        let s: SkippedScenarios =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
         for e in s.into_entries() {
             set.insert((e.domain, e.endpoint, e.id));
         }
@@ -165,9 +174,8 @@ fn load_skip_records(run_dirs: &[PathBuf]) -> Result<HashSet<(String, String, St
     Ok(set)
 }
 
-/// All archived runs under `.jkit/done/<*>/`. Empty when the dir is absent.
-fn archived_run_dirs() -> Vec<PathBuf> {
-    let done = PathBuf::from(".jkit/done");
+fn archived_run_dirs(project_root: &Path) -> Vec<PathBuf> {
+    let done = project_root.join(".jkit/done");
     if !done.is_dir() {
         return Vec::new();
     }
@@ -181,9 +189,7 @@ fn archived_run_dirs() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Sanitize an identifier for use as a Java package segment: replace any
-/// non-`[A-Za-z0-9_]` char with `_`, and prefix `_` if it starts with a digit.
-/// `jkit-demo` → `jkit_demo`.
+/// Sanitize an identifier for use as a Java package segment.
 fn sanitize_pkg_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -202,126 +208,25 @@ fn sanitize_pkg_segment(s: &str) -> String {
     out
 }
 
-fn run_aggregated(run_dir: &Path, test_root: &Path, pom_path: &Path) -> Result<()> {
-    let cs_path = run_dir.join("change-summary.md");
-    if !cs_path.exists() {
-        anyhow::bail!("change-summary.md missing in {}", run_dir.display());
-    }
-    let cs_text = fs::read_to_string(&cs_path)
-        .with_context(|| format!("reading {}", cs_path.display()))?;
-    let domains = parse_affected_domains(&cs_text)
-        .ok_or_else(|| anyhow::anyhow!("change-summary.md: '## Domains Changed' section not found"))?;
-
-    let skipped: HashSet<(String, String, String)> =
-        load_skip_records(&[run_dir.to_path_buf()])?;
-
-    let implemented = implemented_method_names(test_root)?;
-    let pom_meta = read_pom_coords(pom_path).ok();
-
-    let mut out: Vec<GapEntryAggregated> = Vec::new();
-    let domains_root = PathBuf::from("docs/domains");
-    for domain in &domains {
-        let layout = domain_layout::detect_layout(&domains_root, domain);
-        let buckets: Vec<(Option<ApiType>, PathBuf)> = match &layout {
-            DetectedLayout::MultiType(types) => types
-                .iter()
-                .map(|ty| {
-                    (
-                        Some(*ty),
-                        domains_root
-                            .join(domain)
-                            .join(ty.dir_name())
-                            .join("test-scenarios.yaml"),
-                    )
-                })
-                .collect(),
-            _ => vec![(None, domains_root.join(domain).join("test-scenarios.yaml"))],
-        };
-
-        for (api_type, yaml_path) in &buckets {
-            if !yaml_path.exists() {
-                continue;
-            }
-            let entries = load_scenarios(yaml_path)?;
-            for e in &entries {
-                let camel = id_to_camel(&e.id);
-                if implemented.contains(&camel) {
-                    continue;
-                }
-                let key = (domain.clone(), e.endpoint.clone(), e.id.clone());
-                if skipped.contains(&key) {
-                    continue;
-                }
-                let test_class_path =
-                    resolve_test_class_path(test_root, domain, pom_meta.as_ref());
-                out.push(GapEntryAggregated {
-                    domain: domain.clone(),
-                    endpoint: e.endpoint.clone(),
-                    id: e.id.clone(),
-                    description: e.description.clone(),
-                    test_class_path,
-                    test_method_name: camel,
-                    api_type: *api_type,
-                });
-            }
-        }
-    }
-    print_json(&serde_json::json!({ "gaps": out }))
-}
-
-fn load_scenarios(path: &Path) -> Result<Vec<ScenarioEntry>> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed == "[]" {
-        return Ok(Vec::new());
-    }
-    let parsed: Vec<ScenarioEntry> = serde_yaml::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(parsed)
-}
-
 /// Convert a kebab-case id to camelCase.
 pub fn id_to_camel(id: &str) -> String {
     id.to_lower_camel_case()
 }
 
-/// Count unimplemented scenarios per domain.
-///
-/// For each domain in `domains`, scans the domain's `test-scenarios.yaml` (flat
-/// layout) or each per-api-type `test-scenarios.yaml` (multi-type layout) under
-/// `domains_root` and counts entries whose camelCased id has no matching JUnit
-/// `void <name>(` declaration under `test_root`.
-///
-/// Domains whose yaml files don't exist contribute a count of 0. Returned in
-/// the same order as the input.
+/// Count unimplemented scenarios per domain, reading top-level
+/// `docs/test-scenarios.yaml`. Domains absent from the file contribute 0.
 pub fn count_gaps_per_domain(
-    domains_root: &Path,
+    project_root: &Path,
     domains: &[String],
     test_root: &Path,
 ) -> Result<Vec<(String, usize)>> {
+    let file = ScenariosFile::load(project_root)?;
     let implemented = implemented_method_names(test_root)?;
     let mut counts = Vec::with_capacity(domains.len());
     for domain in domains {
-        let layout = domain_layout::detect_layout(domains_root, domain);
-        let yaml_paths: Vec<PathBuf> = match &layout {
-            DetectedLayout::MultiType(types) => types
-                .iter()
-                .map(|ty| {
-                    domains_root
-                        .join(domain)
-                        .join(ty.dir_name())
-                        .join("test-scenarios.yaml")
-                })
-                .collect(),
-            _ => vec![domains_root.join(domain).join("test-scenarios.yaml")],
-        };
         let mut count = 0usize;
-        for yaml_path in &yaml_paths {
-            if !yaml_path.exists() {
-                continue;
-            }
-            let entries = load_scenarios(yaml_path)?;
-            for e in &entries {
+        if let Some(section) = file.section(domain)? {
+            for (_ty, e) in section.iter_with_type() {
                 if !implemented.contains(&id_to_camel(&e.id)) {
                     count += 1;
                 }
@@ -442,14 +347,16 @@ struct PomCoords {
 
 fn read_pom_coords(pom_path: &Path) -> Result<PomCoords> {
     let text = fs::read_to_string(pom_path)?;
-    // Read top-level <groupId>/<artifactId> (skip <parent>'s).
     let stripped = strip_parent_block(&text);
     let group_id = first_inner(&stripped, "groupId").unwrap_or_default();
     let artifact_id = first_inner(&stripped, "artifactId").unwrap_or_default();
     if group_id.is_empty() || artifact_id.is_empty() {
         anyhow::bail!("pom.xml lacks <groupId> or <artifactId>");
     }
-    Ok(PomCoords { group_id, artifact_id })
+    Ok(PomCoords {
+        group_id,
+        artifact_id,
+    })
 }
 
 fn strip_parent_block(text: &str) -> String {
@@ -473,8 +380,6 @@ fn first_inner(text: &str, tag: &str) -> Option<String> {
     Some(text[i..j].trim().to_string())
 }
 
-/// Either the first matching `*<DomainPascal>IntegrationTest.java` under test_root,
-/// or the convention path derived from pom coords. None when pom unreadable.
 fn resolve_test_class_path(
     test_root: &Path,
     domain: &str,
@@ -495,9 +400,6 @@ fn resolve_test_class_path(
         }
     }
     let coords = pom?;
-    // Sanitize each segment so the synthesized path is a valid Java package.
-    // groupId may contain hyphens (`com.foo-bar.baz` → `com/foo_bar/baz`),
-    // and artifactId commonly does (`jkit-demo` → `jkit_demo`).
     let group_path: String = coords
         .group_id
         .split('.')
@@ -530,5 +432,32 @@ mod tests {
         let md = "# Foo\n\n## Domains Changed\n\n| Domain | Notes |\n|---|---|\n| billing | new endpoint |\n| inventory | tweak |\n\n## Other\n";
         let v = parse_affected_domains(md).unwrap();
         assert_eq!(v, vec!["billing", "inventory"]);
+    }
+
+    #[test]
+    fn count_gaps_reads_top_level_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(
+            tmp.path().join("docs/test-scenarios.yaml"),
+            r#"domains:
+  billing:
+    - endpoint: GET /a
+      id: alpha-bravo
+      description: ok
+    - endpoint: GET /b
+      id: charlie-delta
+      description: ok
+"#,
+        )
+        .unwrap();
+        let counts = count_gaps_per_domain(
+            tmp.path(),
+            &["billing".to_string(), "missing".to_string()],
+            Path::new("/nonexistent"),
+        )
+        .unwrap();
+        assert_eq!(counts[0], ("billing".to_string(), 2));
+        assert_eq!(counts[1], ("missing".to_string(), 0));
     }
 }

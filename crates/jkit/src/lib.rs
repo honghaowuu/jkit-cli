@@ -11,5 +11,6 @@ pub mod migrate;
 pub mod migration;
 pub mod pom;
 pub mod scenarios;
+pub mod scenarios_yaml;
 pub mod standards;
 pub mod util;
