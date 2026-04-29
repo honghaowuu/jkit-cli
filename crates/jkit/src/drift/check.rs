@@ -16,14 +16,20 @@
 //! - `parameter_missing_in_code` / `parameter_added_in_code`
 //!   — set difference over `(name, in)` pairs of declared parameters
 //! - `parameter_required_changed` — same `(name, in)`, different `required` flag
+//! - `response_required_field_missing_in_code` / `..._added_in_code`
+//!   — set difference over each `responses.<status>` schema's required fields,
+//!   restricted to status codes present in BOTH proposal and code (status-set
+//!   diffs are caught separately by `response_status_*` and surfacing
+//!   field-level diffs against an absent status would just duplicate them)
 //!
 //! Untouched paths in code (paths the proposal doesn't touch) intentionally
 //! do not surface as drift — the proposal is a strict delta of what changes,
 //! not a full surface.
 //!
-//! Response body schema diffs are deferred to a later slice — the proposal
-//! still requires `components.schemas` for added/modified shapes, but the
-//! diff doesn't compare response shapes structurally yet.
+//! Type-level diffs (a property whose `type` changed between proposal and
+//! code) are not emitted — schema validation annotations + runtime tests
+//! usually catch those faster. `oneOf`/`anyOf` requireds aren't walked
+//! because they're conditional, not absolute.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -142,6 +148,7 @@ fn diff_inner(proposal: &JsonValue, code: &JsonValue) -> Vec<DriftFinding> {
                     diff_response_statuses(&endpoint, &prop_view, &actual_view, &mut out);
                     diff_request_required(&endpoint, &prop_view, &actual_view, &mut out);
                     diff_parameters(&endpoint, &prop_view, &actual_view, &mut out);
+                    diff_response_required(&endpoint, &prop_view, &actual_view, &mut out);
                 }
             }
         }
@@ -209,6 +216,39 @@ fn diff_request_required(
     }
 }
 
+fn diff_response_required(
+    endpoint: &str,
+    p: &OperationView,
+    a: &OperationView,
+    out: &mut Vec<DriftFinding>,
+) {
+    // Restrict to status codes present in both. Status-set diffs are caught
+    // by diff_response_statuses; if status `201` is in proposal but absent
+    // from code, surfacing every required-field difference under it would
+    // just duplicate the status-level finding.
+    for (status, prop_set) in &p.response_required {
+        let Some(actual_set) = a.response_required.get(status) else {
+            continue;
+        };
+        for field in prop_set.difference(actual_set) {
+            out.push(DriftFinding {
+                kind: "response_required_field_missing_in_code",
+                endpoint: endpoint.to_string(),
+                proposed: Some(json!({"status": status, "field": field})),
+                actual: None,
+            });
+        }
+        for field in actual_set.difference(prop_set) {
+            out.push(DriftFinding {
+                kind: "response_required_field_added_in_code",
+                endpoint: endpoint.to_string(),
+                proposed: None,
+                actual: Some(json!({"status": status, "field": field})),
+            });
+        }
+    }
+}
+
 fn diff_parameters(
     endpoint: &str,
     p: &OperationView,
@@ -260,6 +300,9 @@ struct OperationView {
     /// `(name, in)` → `required: bool` over declared parameters (resolves
     /// `$ref` to `#/components/parameters/<Name>`).
     parameters: BTreeMap<(String, String), bool>,
+    /// Per-status-code required fields drawn from the response schemas
+    /// (set-union over content-types; resolves `$ref` and `allOf`).
+    response_required: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl OperationView {
@@ -268,6 +311,7 @@ impl OperationView {
             response_codes: response_codes(op),
             request_required: request_required_fields(op, components),
             parameters: parameters_for(op, components),
+            response_required: response_required_fields(op, components),
         }
     }
 }
@@ -327,6 +371,41 @@ fn request_required_fields(op: &JsonValue, components: Option<&JsonValue>) -> BT
     for (_mt, media) in content {
         if let Some(schema) = media.get("schema") {
             collect_required(schema, components, &mut out, &mut visited);
+        }
+    }
+    out
+}
+
+/// Walk `operation.responses.<status>.content.<media>.schema` for each
+/// status code; same `$ref` / `allOf` semantics as request bodies. Returns
+/// a per-status map; status codes whose response object has no schema are
+/// absent from the map (rather than mapping to an empty set) so the diff
+/// caller can distinguish "no schema declared" from "schema declared with
+/// no required fields."
+fn response_required_fields(
+    op: &JsonValue,
+    components: Option<&JsonValue>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out = BTreeMap::new();
+    let Some(responses) = op.get("responses").and_then(|r| r.as_object()) else {
+        return out;
+    };
+    for (status, response) in responses {
+        let response = resolve_ref(response, components, "responses").unwrap_or(response.clone());
+        let Some(content) = response.get("content").and_then(|c| c.as_object()) else {
+            continue;
+        };
+        let mut required: BTreeSet<String> = BTreeSet::new();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut had_schema = false;
+        for (_mt, media) in content {
+            if let Some(schema) = media.get("schema") {
+                had_schema = true;
+                collect_required(schema, components, &mut required, &mut visited);
+            }
+        }
+        if had_schema {
+            out.insert(status.clone(), required);
         }
     }
     out
@@ -751,6 +830,145 @@ paths:
         assert!(d
             .iter()
             .any(|f| f.kind == "parameter_required_changed" && f.endpoint == "GET /a"));
+    }
+
+    #[test]
+    fn response_required_field_missing_in_code() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name]
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{"responses":{"200":{
+                "description":"ok",
+                "content":{"application/json":{"schema":{
+                    "type":"object","required":["id"]
+                }}}
+            }}}}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        assert!(d.iter().any(|f| f.kind == "response_required_field_missing_in_code"
+            && f.proposed == Some(json!({"status":"200","field":"name"}))));
+    }
+
+    #[test]
+    fn response_required_field_added_in_code() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{"responses":{"200":{
+                "description":"ok",
+                "content":{"application/json":{"schema":{
+                    "type":"object","required":["id","createdAt"]
+                }}}
+            }}}}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        assert!(d.iter().any(|f| f.kind == "response_required_field_added_in_code"
+            && f.actual == Some(json!({"status":"200","field":"createdAt"}))));
+    }
+
+    #[test]
+    fn response_required_resolves_ref_and_allof() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Base'
+                  - type: object
+                    required: [extra]
+components:
+  schemas:
+    Base:
+      type: object
+      required: [baseId]
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{"responses":{"200":{
+                "description":"ok",
+                "content":{"application/json":{"schema":{
+                    "type":"object","required":["baseId"]
+                }}}
+            }}}}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        // Proposal requires {baseId, extra} on 200; code requires {baseId}.
+        assert!(d.iter().any(|f| f.kind == "response_required_field_missing_in_code"
+            && f.proposed == Some(json!({"status":"200","field":"extra"}))));
+    }
+
+    #[test]
+    fn response_field_diff_skipped_for_status_only_on_one_side() {
+        // When 201 is in proposal but not in code, the status-set diff
+        // already emits response_status_missing_in_code. Field-level diffs
+        // for 201 should NOT also fire — it would duplicate the signal.
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"post":{"responses":{"200":{
+                "description":"ok",
+                "content":{"application/json":{"schema":{
+                    "type":"object","required":["id","createdAt"]
+                }}}
+            }}}}}}"#,
+        );
+        let d = diff(&proposal, &code);
+        // Status-set diff fires once each direction; no field-level findings.
+        assert!(d.iter().any(|f| f.kind == "response_status_missing_in_code"));
+        assert!(d.iter().any(|f| f.kind == "response_status_added_in_code"));
+        assert!(!d
+            .iter()
+            .any(|f| f.kind.starts_with("response_required_field_")));
     }
 
     #[test]
