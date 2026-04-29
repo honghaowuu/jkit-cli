@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod init;
 pub mod migrate;
 pub mod migration;
+pub mod permissions;
 pub mod pom;
 pub mod proposed_api;
 pub mod scenarios;

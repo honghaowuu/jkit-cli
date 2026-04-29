@@ -47,6 +47,13 @@ enum Top {
         #[command(subcommand)]
         cmd: jkit::domains::DomainsCmd,
     },
+    /// Aggregate every `@Permission` code referenced under src — used
+    /// when authoring new auth-protected endpoints to pick a non-colliding
+    /// `<module>.<OPERATION>` code.
+    Permissions {
+        #[command(subcommand)]
+        cmd: jkit::permissions::PermissionsCmd,
+    },
     /// Compact JSON view of one domain (slug + description + use_when +
     /// scenario summary). Used by spec-delta clarification, writing-plans,
     /// and java-tdd to gather per-domain context without per-file reads.
@@ -80,6 +87,7 @@ fn main() -> ExitCode {
         Top::Changes { cmd } => jkit::changes::run(cmd),
         Top::Standards { cmd } => jkit::standards::run(cmd),
         Top::Domains { cmd } => jkit::domains::run(cmd),
+        Top::Permissions { cmd } => jkit::permissions::run(cmd),
         Top::DomainContext(args) => jkit::domain_context::run(args),
         Top::ApiSpec { cmd } => jkit::api_spec::run(cmd),
         Top::Init { cmd } => match cmd {
