@@ -1,3 +1,4 @@
+pub mod api_spec;
 pub mod changes;
 pub mod conflicts;
 pub mod contract;

@@ -56,6 +56,13 @@ enum Top {
     /// and java-tdd to gather per-domain context without per-file reads.
     #[command(name = "domain-context")]
     DomainContext(jkit::domain_context::DomainContextArgs),
+    /// On-demand OpenAPI 3.x slice for one domain — runs smartdoc against
+    /// the project's controllers and filters to the requested slug.
+    #[command(name = "api-spec")]
+    ApiSpec {
+        #[command(subcommand)]
+        cmd: jkit::api_spec::ApiSpecCmd,
+    },
     /// One-shot project bootstrap: changes bootstrap + standards init + scaffold.
     /// Idempotent — re-running completes only what's missing.
     Init {
@@ -79,6 +86,7 @@ fn main() -> ExitCode {
         Top::Standards { cmd } => jkit::standards::run(cmd),
         Top::Domains { cmd } => jkit::domains::run(cmd),
         Top::DomainContext(args) => jkit::domain_context::run(args),
+        Top::ApiSpec { cmd } => jkit::api_spec::run(cmd),
         Top::Init { cmd } => match cmd {
             Some(c) => jkit::init::run(c),
             None => jkit::init::run_umbrella(),
