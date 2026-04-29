@@ -60,6 +60,11 @@ pub struct DriftFinding {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub endpoint: String,
+    /// Set for `--against published-contract` mode — `"issue"` (major bump
+    /// required) or `"warning"` (minor bump). Unset for `--plan` mode where
+    /// every drift entry already routes through the A/B/C gate uniformly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposed: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +143,7 @@ fn diff_inner(proposal: &JsonValue, code: &JsonValue) -> Vec<DriftFinding> {
             match actual_op_raw {
                 None => out.push(DriftFinding {
                     kind: "endpoint_missing_in_code",
+                    severity: None,
                     endpoint,
                     proposed: Some(json!({"declared": true})),
                     actual: None,
@@ -157,6 +163,7 @@ fn diff_inner(proposal: &JsonValue, code: &JsonValue) -> Vec<DriftFinding> {
                 if !proposed_methods.contains_key(method) {
                     out.push(DriftFinding {
                         kind: "endpoint_added_in_code",
+                        severity: None,
                         endpoint: endpoint_label(method, path),
                         proposed: None,
                         actual: Some(json!({"declared": true})),
@@ -177,6 +184,7 @@ fn diff_response_statuses(
     for status in p.response_codes.difference(&a.response_codes) {
         out.push(DriftFinding {
             kind: "response_status_missing_in_code",
+            severity: None,
             endpoint: endpoint.to_string(),
             proposed: Some(JsonValue::String(status.clone())),
             actual: None,
@@ -185,6 +193,7 @@ fn diff_response_statuses(
     for status in a.response_codes.difference(&p.response_codes) {
         out.push(DriftFinding {
             kind: "response_status_added_in_code",
+            severity: None,
             endpoint: endpoint.to_string(),
             proposed: None,
             actual: Some(JsonValue::String(status.clone())),
@@ -201,6 +210,7 @@ fn diff_request_required(
     for field in p.request_required.difference(&a.request_required) {
         out.push(DriftFinding {
             kind: "request_required_field_missing_in_code",
+            severity: None,
             endpoint: endpoint.to_string(),
             proposed: Some(JsonValue::String(field.clone())),
             actual: None,
@@ -209,6 +219,7 @@ fn diff_request_required(
     for field in a.request_required.difference(&p.request_required) {
         out.push(DriftFinding {
             kind: "request_required_field_added_in_code",
+            severity: None,
             endpoint: endpoint.to_string(),
             proposed: None,
             actual: Some(JsonValue::String(field.clone())),
@@ -233,6 +244,7 @@ fn diff_response_required(
         for field in prop_set.difference(actual_set) {
             out.push(DriftFinding {
                 kind: "response_required_field_missing_in_code",
+                severity: None,
                 endpoint: endpoint.to_string(),
                 proposed: Some(json!({"status": status, "field": field})),
                 actual: None,
@@ -241,6 +253,7 @@ fn diff_response_required(
         for field in actual_set.difference(prop_set) {
             out.push(DriftFinding {
                 kind: "response_required_field_added_in_code",
+                severity: None,
                 endpoint: endpoint.to_string(),
                 proposed: None,
                 actual: Some(json!({"status": status, "field": field})),
@@ -258,19 +271,23 @@ fn diff_parameters(
     let p_keys: BTreeSet<_> = p.parameters.keys().collect();
     let a_keys: BTreeSet<_> = a.parameters.keys().collect();
     for key in p_keys.difference(&a_keys) {
+        let required = p.parameters[*key];
         out.push(DriftFinding {
             kind: "parameter_missing_in_code",
+            severity: None,
             endpoint: endpoint.to_string(),
-            proposed: Some(json!({"name": key.0, "in": key.1})),
+            proposed: Some(json!({"name": key.0, "in": key.1, "required": required})),
             actual: None,
         });
     }
     for key in a_keys.difference(&p_keys) {
+        let required = a.parameters[*key];
         out.push(DriftFinding {
             kind: "parameter_added_in_code",
+            severity: None,
             endpoint: endpoint.to_string(),
             proposed: None,
-            actual: Some(json!({"name": key.0, "in": key.1})),
+            actual: Some(json!({"name": key.0, "in": key.1, "required": required})),
         });
     }
     for key in p_keys.intersection(&a_keys) {
@@ -279,6 +296,7 @@ fn diff_parameters(
         if pr != ar {
             out.push(DriftFinding {
                 kind: "parameter_required_changed",
+                severity: None,
                 endpoint: endpoint.to_string(),
                 proposed: Some(json!({"name": key.0, "in": key.1, "required": pr})),
                 actual: Some(json!({"name": key.0, "in": key.1, "required": ar})),
@@ -289,6 +307,149 @@ fn diff_parameters(
 
 fn endpoint_label(method: &str, path: &str) -> String {
     format!("{} {}", method.to_uppercase(), path)
+}
+
+/// CLI entry for `--against published-contract --contract-yaml <path>`.
+/// Loads the contract YAML, runs smartdoc, diffs, prints. The plan-mode
+/// twin (`run`) lives above.
+pub fn run_against_contract(contract_path: &Path, pom_path: &Path) -> Result<()> {
+    let cwd = std::env::current_dir().context("reading cwd")?;
+    let contract_abs = if contract_path.is_absolute() {
+        contract_path.to_path_buf()
+    } else {
+        cwd.join(contract_path)
+    };
+    if !contract_abs.is_file() {
+        anyhow::bail!("contract file not found: {}", contract_path.display());
+    }
+    let contract_text = fs::read_to_string(&contract_abs)
+        .with_context(|| format!("reading {}", contract_abs.display()))?;
+    let contract_yaml: YamlValue = serde_yaml::from_str(&contract_text)
+        .with_context(|| format!("parsing {} as YAML", contract_abs.display()))?;
+
+    let code_spec = crate::migrate::smartdoc::run_smartdoc(pom_path)?;
+
+    let drift = diff_against_contract(&contract_yaml, &code_spec);
+    let any_issue = drift.iter().any(|f| f.severity == Some("issue"));
+
+    let label = contract_abs
+        .strip_prefix(&cwd)
+        .unwrap_or(&contract_abs)
+        .to_string_lossy()
+        .into_owned();
+
+    print_json(&serde_json::json!({
+        "ok": !any_issue,
+        "mode": "against_published_contract",
+        "contract": label,
+        "drift": drift,
+    }))
+}
+
+/// Bidirectional diff between a published `contract.yaml` (the last release's
+/// authoritative surface) and current code's smartdoc output. Unlike the
+/// proposal-vs-code diff, the contract is the FULL surface — every endpoint
+/// in either side that doesn't have a counterpart is drift.
+///
+/// Annotates each finding with `severity` per the formal-docs redesign's
+/// semver table:
+///   additions / loosenings → "warning" (minor bump)
+///   removals / tightenings / status changes → "issue" (major bump required)
+///
+/// `kind` strings are the same as `--plan` mode (`endpoint_missing_in_code`
+/// = removed; `endpoint_added_in_code` = added; etc.) — consumers branch on
+/// `severity` rather than maintaining two sets of finding type names.
+pub fn diff_against_contract(contract: &YamlValue, code: &JsonValue) -> Vec<DriftFinding> {
+    let contract_json: JsonValue = serde_json::to_value(contract).unwrap_or(JsonValue::Null);
+    let mut findings = diff_inner(&contract_json, code);
+    // diff_inner emits the proposal-side findings (paths the contract declares,
+    // diff'd against code). For full-surface mode we ALSO need to walk paths
+    // present only in code (additions). The existing paths_from(...) → for
+    // path in proposal { ... if !proposed_methods.contains(method) → added }
+    // already handles methods on shared paths; what's still missing is paths
+    // present only in code (no entry in the contract at all).
+    let contract_paths = paths_from(&contract_json);
+    let code_paths = paths_from(code);
+    for (path, methods) in &code_paths {
+        if contract_paths.contains_key(path) {
+            continue;
+        }
+        for method in methods.keys() {
+            findings.push(DriftFinding {
+                kind: "endpoint_added_in_code",
+                severity: None,
+                endpoint: endpoint_label(method, path),
+                proposed: None,
+                actual: Some(json!({"declared": true})),
+            });
+        }
+    }
+    annotate_severity_against_contract(&mut findings);
+    findings
+}
+
+/// Walk findings and set `severity` per the spec table. Only meaningful in
+/// the `--against published-contract` flow.
+fn annotate_severity_against_contract(findings: &mut [DriftFinding]) {
+    for f in findings.iter_mut() {
+        f.severity = Some(severity_for(f));
+    }
+}
+
+fn severity_for(f: &DriftFinding) -> &'static str {
+    match f.kind {
+        // Additions / loosenings — minor bump
+        "endpoint_added_in_code"
+        | "response_status_added_in_code"
+        | "request_required_field_missing_in_code"
+        | "response_required_field_added_in_code" => "warning",
+
+        // Removals / tightenings — major bump
+        "endpoint_missing_in_code"
+        | "response_status_missing_in_code"
+        | "request_required_field_added_in_code"
+        | "response_required_field_missing_in_code" => "issue",
+
+        "parameter_added_in_code" => {
+            // Adding an optional parameter is a minor bump; adding a required
+            // one breaks existing callers (they must now supply it).
+            if param_required_actual(f) { "issue" } else { "warning" }
+        }
+        "parameter_missing_in_code" => {
+            // Removing an optional parameter is broadly safe; removing a
+            // required one means callers that supplied it now hit an
+            // unexpected field — not technically breaking on the wire, but
+            // a contract change consumers depend on.
+            if param_required_proposed(f) { "issue" } else { "warning" }
+        }
+        "parameter_required_changed" => {
+            // false → true tightens (issue); true → false loosens (warning).
+            if param_required_proposed(f) {
+                "warning"
+            } else {
+                "issue"
+            }
+        }
+
+        // Unknown finding type — fail closed.
+        _ => "issue",
+    }
+}
+
+fn param_required_proposed(f: &DriftFinding) -> bool {
+    f.proposed
+        .as_ref()
+        .and_then(|v| v.get("required"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn param_required_actual(f: &DriftFinding) -> bool {
+    f.actual
+        .as_ref()
+        .and_then(|v| v.get("required"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -777,7 +938,7 @@ paths:
         );
         let d = diff(&proposal, &code);
         assert!(d.iter().any(|f| f.kind == "parameter_added_in_code"
-            && f.actual == Some(json!({"name":"size","in":"query"}))));
+            && f.actual == Some(json!({"name":"size","in":"query","required":false}))));
     }
 
     #[test]
@@ -803,7 +964,7 @@ paths:
         );
         let d = diff(&proposal, &code);
         assert!(d.iter().any(|f| f.kind == "parameter_missing_in_code"
-            && f.proposed == Some(json!({"name":"size","in":"query"}))));
+            && f.proposed == Some(json!({"name":"size","in":"query","required":false}))));
     }
 
     #[test]
@@ -969,6 +1130,287 @@ paths:
         assert!(!d
             .iter()
             .any(|f| f.kind.starts_with("response_required_field_")));
+    }
+
+    // --- diff_against_contract + severity ---
+
+    #[test]
+    fn against_contract_endpoint_added_in_code_is_warning() {
+        let contract = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{
+                "/a":{"get":{"responses":{"200":{"description":"ok"}}}},
+                "/b":{"get":{"responses":{"200":{"description":"ok"}}}}
+            }}"#,
+        );
+        let d = diff_against_contract(&contract, &code);
+        let f = d
+            .iter()
+            .find(|f| f.kind == "endpoint_added_in_code" && f.endpoint == "GET /b")
+            .expect("missing endpoint_added_in_code");
+        assert_eq!(f.severity, Some("warning"));
+    }
+
+    #[test]
+    fn against_contract_endpoint_removed_is_issue() {
+        let contract = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      responses:
+        '200': {description: ok}
+  /b:
+    get:
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(r#"{"paths":{"/a":{"get":{"responses":{"200":{"description":"ok"}}}}}}"#);
+        let d = diff_against_contract(&contract, &code);
+        let f = d
+            .iter()
+            .find(|f| f.kind == "endpoint_missing_in_code" && f.endpoint == "GET /b")
+            .expect("missing endpoint_missing_in_code");
+        assert_eq!(f.severity, Some("issue"));
+    }
+
+    #[test]
+    fn against_contract_response_status_change_severity() {
+        let contract = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{"responses":{
+                "404":{"description":"not found"}
+            }}}}}"#,
+        );
+        let d = diff_against_contract(&contract, &code);
+        // 200 removed → issue; 404 added → warning
+        let removed = d
+            .iter()
+            .find(|f| f.kind == "response_status_missing_in_code")
+            .unwrap();
+        assert_eq!(removed.severity, Some("issue"));
+        let added = d
+            .iter()
+            .find(|f| f.kind == "response_status_added_in_code")
+            .unwrap();
+        assert_eq!(added.severity, Some("warning"));
+    }
+
+    #[test]
+    fn against_contract_request_required_tightening_is_issue() {
+        let contract = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object, required: [customerId]}
+      responses:
+        '201': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"post":{
+                "requestBody":{"content":{"application/json":{"schema":{
+                    "type":"object","required":["customerId","amount"]
+                }}}},
+                "responses":{"201":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff_against_contract(&contract, &code);
+        let f = d
+            .iter()
+            .find(|f| f.kind == "request_required_field_added_in_code")
+            .expect("missing tightening finding");
+        assert_eq!(f.severity, Some("issue"));
+    }
+
+    #[test]
+    fn against_contract_request_required_loosening_is_warning() {
+        let contract = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object, required: [customerId, amount]}
+      responses:
+        '201': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"post":{
+                "requestBody":{"content":{"application/json":{"schema":{
+                    "type":"object","required":["customerId"]
+                }}}},
+                "responses":{"201":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff_against_contract(&contract, &code);
+        let f = d
+            .iter()
+            .find(|f| f.kind == "request_required_field_missing_in_code")
+            .expect("missing loosening finding");
+        assert_eq!(f.severity, Some("warning"));
+    }
+
+    #[test]
+    fn against_contract_response_required_removal_is_issue() {
+        let contract = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: {type: object, required: [id, name]}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{"responses":{"200":{
+                "description":"ok",
+                "content":{"application/json":{"schema":{
+                    "type":"object","required":["id"]
+                }}}
+            }}}}}}"#,
+        );
+        let d = diff_against_contract(&contract, &code);
+        let f = d
+            .iter()
+            .find(|f| f.kind == "response_required_field_missing_in_code")
+            .expect("missing finding");
+        assert_eq!(f.severity, Some("issue"));
+    }
+
+    #[test]
+    fn against_contract_required_param_added_is_issue_optional_is_warning() {
+        let contract = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{"/a":{"get":{
+                "parameters":[
+                    {"name":"required-one","in":"query","required":true},
+                    {"name":"optional-one","in":"query","required":false}
+                ],
+                "responses":{"200":{"description":"ok"}}
+            }}}}"#,
+        );
+        let d = diff_against_contract(&contract, &code);
+        let req = d
+            .iter()
+            .find(|f| f.kind == "parameter_added_in_code"
+                && f.actual.as_ref().unwrap()["name"] == "required-one")
+            .unwrap();
+        assert_eq!(req.severity, Some("issue"));
+        let opt = d
+            .iter()
+            .find(|f| f.kind == "parameter_added_in_code"
+                && f.actual.as_ref().unwrap()["name"] == "optional-one")
+            .unwrap();
+        assert_eq!(opt.severity, Some("warning"));
+    }
+
+    #[test]
+    fn against_contract_param_required_flag_change_severity() {
+        let contract = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    get:
+      parameters:
+        - {name: page, in: query, required: false}
+      responses:
+        '200': {description: ok}
+  /b:
+    get:
+      parameters:
+        - {name: page, in: query, required: true}
+      responses:
+        '200': {description: ok}
+"#,
+        );
+        let code = json(
+            r#"{"paths":{
+                "/a":{"get":{
+                    "parameters":[{"name":"page","in":"query","required":true}],
+                    "responses":{"200":{"description":"ok"}}
+                }},
+                "/b":{"get":{
+                    "parameters":[{"name":"page","in":"query","required":false}],
+                    "responses":{"200":{"description":"ok"}}
+                }}
+            }}"#,
+        );
+        let d = diff_against_contract(&contract, &code);
+        let tightening = d
+            .iter()
+            .find(|f| f.kind == "parameter_required_changed" && f.endpoint == "GET /a")
+            .unwrap();
+        assert_eq!(tightening.severity, Some("issue"));
+        let loosening = d
+            .iter()
+            .find(|f| f.kind == "parameter_required_changed" && f.endpoint == "GET /b")
+            .unwrap();
+        assert_eq!(loosening.severity, Some("warning"));
+    }
+
+    #[test]
+    fn plan_mode_findings_have_no_severity() {
+        let proposal = yaml(
+            r#"openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      responses:
+        '201': {description: ok}
+"#,
+        );
+        let code = json(r#"{"paths":{"/a":{"post":{"responses":{"200":{"description":"ok"}}}}}}"#);
+        let d = diff(&proposal, &code);
+        assert!(!d.is_empty());
+        for f in &d {
+            assert!(f.severity.is_none(), "plan mode should not emit severity: {:?}", f);
+        }
     }
 
     #[test]

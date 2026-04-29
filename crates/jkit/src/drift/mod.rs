@@ -15,19 +15,34 @@ pub enum DriftCmd {
         #[arg(long)]
         run: PathBuf,
     },
-    /// Diff `<run>/proposed-api.yaml` against the current code's smartdoc
-    /// output. Surfaces endpoints/methods/response-status drift between the
-    /// approved proposal and the implementation.
+    /// Diff smartdoc(code) against either the run's `proposed-api.yaml`
+    /// (`--plan` mode) or a published `contract.yaml` (`--against
+    /// published-contract` mode). Exactly one of `--plan` / `--against`
+    /// must be passed.
     ///
-    /// Slice 5 scope: paths, methods, response status codes. Schema-level
-    /// diffs (request bodies, response shapes) ship in a later slice.
+    /// Diff scope (both modes): paths, methods, response status codes,
+    /// request body required fields, parameters, response body required
+    /// fields. Schema-walking resolves `$ref` to `components.schemas` and
+    /// recurses into `allOf`. Type-level diffs and `oneOf`/`anyOf` walks
+    /// are not emitted.
+    ///
+    /// `--against published-contract` annotates each finding with
+    /// `severity` (`issue` for major-bump-required removals/tightenings;
+    /// `warning` for minor-bump additions/loosenings).
     Check {
-        /// Path to `<run>/plan.md` — the run dir is its parent. The diff
-        /// itself reads the sibling `proposed-api.yaml`; the plan path is
-        /// taken to anchor the run dir without forcing callers to compute
-        /// it.
-        #[arg(long)]
-        plan: PathBuf,
+        /// Path to `<run>/plan.md` — the run dir is its parent. Triggers
+        /// `--plan` mode. Mutually exclusive with `--against`.
+        #[arg(long, conflicts_with = "against")]
+        plan: Option<PathBuf>,
+        /// Currently the only valid value is `published-contract`. The
+        /// reference document is read from `--contract-yaml`. Auto-resolution
+        /// from `.jkit/contract.json` lands in a follow-up slice.
+        #[arg(long, value_parser = ["published-contract"])]
+        against: Option<String>,
+        /// Path to the published `contract.yaml` to diff against. Required
+        /// when `--against published-contract` is set.
+        #[arg(long = "contract-yaml")]
+        contract_yaml: Option<PathBuf>,
         #[arg(long, default_value = "pom.xml")]
         pom: PathBuf,
     },
@@ -62,7 +77,29 @@ pub enum DriftCmd {
 pub fn run(cmd: DriftCmd) -> Result<()> {
     match cmd {
         DriftCmd::ValidateProposal { run } => crate::proposed_api::validate::run(&run),
-        DriftCmd::Check { plan, pom } => check::run(&plan, &pom),
+        DriftCmd::Check {
+            plan,
+            against,
+            contract_yaml,
+            pom,
+        } => match (plan, against, contract_yaml) {
+            (Some(plan_path), None, None) => check::run(&plan_path, &pom),
+            (None, Some(_), Some(contract_path)) => {
+                check::run_against_contract(&contract_path, &pom)
+            }
+            (None, Some(_), None) => Err(anyhow::anyhow!(
+                "--against published-contract requires --contract-yaml <path>"
+            )),
+            (None, None, _) => Err(anyhow::anyhow!(
+                "exactly one of --plan or --against must be supplied"
+            )),
+            (Some(_), Some(_), _) => Err(anyhow::anyhow!(
+                "--plan and --against are mutually exclusive"
+            )),
+            (Some(_), None, Some(_)) => Err(anyhow::anyhow!(
+                "--contract-yaml requires --against published-contract"
+            )),
+        },
         DriftCmd::Report {
             domain,
             src,
