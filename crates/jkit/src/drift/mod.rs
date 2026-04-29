@@ -1,3 +1,4 @@
+pub mod check;
 pub mod report;
 
 use anyhow::Result;
@@ -13,6 +14,22 @@ pub enum DriftCmd {
         /// Path to a `.jkit/<run>/` directory.
         #[arg(long)]
         run: PathBuf,
+    },
+    /// Diff `<run>/proposed-api.yaml` against the current code's smartdoc
+    /// output. Surfaces endpoints/methods/response-status drift between the
+    /// approved proposal and the implementation.
+    ///
+    /// Slice 5 scope: paths, methods, response status codes. Schema-level
+    /// diffs (request bodies, response shapes) ship in a later slice.
+    Check {
+        /// Path to `<run>/plan.md` — the run dir is its parent. The diff
+        /// itself reads the sibling `proposed-api.yaml`; the plan path is
+        /// taken to anchor the run dir without forcing callers to compute
+        /// it.
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long, default_value = "pom.xml")]
+        pom: PathBuf,
     },
     /// Report bi-directional drift between controllers and api-spec.yaml.
     /// Code-without-spec entries route to /write-change → /spec-delta;
@@ -45,6 +62,7 @@ pub enum DriftCmd {
 pub fn run(cmd: DriftCmd) -> Result<()> {
     match cmd {
         DriftCmd::ValidateProposal { run } => crate::proposed_api::validate::run(&run),
+        DriftCmd::Check { plan, pom } => check::run(&plan, &pom),
         DriftCmd::Report {
             domain,
             src,

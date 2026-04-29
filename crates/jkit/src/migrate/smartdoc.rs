@@ -31,10 +31,17 @@ pub fn slice_per_domain(
     meta: &ServiceMeta,
     class_to_slug_type: &HashMap<String, (String, ApiType)>,
 ) -> Result<SmartdocResult> {
-    // Snapshot the pristine project files BEFORE any mutation so the smart-doc
-    // plugin install + smart-doc.json write can be undone after we've extracted
-    // openapi.json. Migration is a one-shot read of existing reality; leaving
-    // the project's pom.xml mutated would surprise users.
+    let spec = run_smartdoc(pom)?;
+    slice_parsed_spec(spec, meta, class_to_slug_type)
+}
+
+/// Run smartdoc against the project and return the parsed `openapi.json`
+/// content. Snapshots and restores `pom.xml` + `smart-doc.json` so the
+/// project tree is untouched after the call.
+///
+/// Used by `migrate scaffold-docs` (which slices per-domain) and by
+/// `drift check --plan` (which diffs against `proposed-api.yaml`).
+pub fn run_smartdoc(pom: &Path) -> Result<serde_json::Value> {
     let pom_original = fs::read_to_string(pom)
         .with_context(|| format!("reading {} for restore snapshot", pom.display()))?;
     let sd_path = Path::new("smart-doc.json");
@@ -46,7 +53,7 @@ pub fn slice_per_domain(
         None
     };
 
-    let result = slice_per_domain_inner(pom, sd_path, meta, class_to_slug_type);
+    let result = run_smartdoc_inner(pom, sd_path);
 
     restore_originals(pom, &pom_original, sd_path, smartdoc_original.as_deref());
 
@@ -81,14 +88,7 @@ fn restore_originals(
     }
 }
 
-fn slice_per_domain_inner(
-    pom: &Path,
-    sd_path: &Path,
-    meta: &ServiceMeta,
-    class_to_slug_type: &HashMap<String, (String, ApiType)>,
-) -> Result<SmartdocResult> {
-    let mut warnings = Vec::new();
-
+fn run_smartdoc_inner(pom: &Path, sd_path: &Path) -> Result<serde_json::Value> {
     pom_prereqs::compute(ProfileArg::SmartDoc, true, pom)
         .context("installing smart-doc Maven plugin via pom prereqs")?;
 
@@ -124,6 +124,16 @@ fn slice_per_domain_inner(
     let raw = fs::read_to_string(&openapi_json_path)?;
     let spec: serde_json::Value = serde_json::from_str(&raw)
         .context("parsing smart-doc's openapi.json")?;
+    let _ = fs::remove_file(&openapi_json_path);
+    Ok(spec)
+}
+
+fn slice_parsed_spec(
+    spec: serde_json::Value,
+    meta: &ServiceMeta,
+    class_to_slug_type: &HashMap<String, (String, ApiType)>,
+) -> Result<SmartdocResult> {
+    let mut warnings = Vec::new();
 
     let info = spec.get("info").cloned().unwrap_or_else(|| {
         serde_json::json!({"title": "auto-scaffolded", "version": "0.1.0"})
@@ -226,8 +236,6 @@ fn slice_per_domain_inner(
             .context("converting per-domain OpenAPI doc to YAML")?;
         per_domain_yaml.insert((slug, api_type), yaml);
     }
-
-    let _ = fs::remove_file(&openapi_json_path);
 
     Ok(SmartdocResult {
         per_domain_yaml,
