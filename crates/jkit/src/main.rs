@@ -47,6 +47,10 @@ enum Top {
         #[command(subcommand)]
         cmd: jkit::standards::StandardsCmd,
     },
+    Domains {
+        #[command(subcommand)]
+        cmd: jkit::domains::DomainsCmd,
+    },
     /// One-shot project bootstrap: changes bootstrap + standards init + scaffold.
     /// Idempotent — re-running completes only what's missing.
     Init {
@@ -68,6 +72,7 @@ fn main() -> ExitCode {
         Top::Contract { cmd } => jkit::contract::run(cmd),
         Top::Changes { cmd } => jkit::changes::run(cmd),
         Top::Standards { cmd } => jkit::standards::run(cmd),
+        Top::Domains { cmd } => jkit::domains::run(cmd),
         Top::Init { cmd } => match cmd {
             Some(c) => jkit::init::run(c),
             None => jkit::init::run_umbrella(),
