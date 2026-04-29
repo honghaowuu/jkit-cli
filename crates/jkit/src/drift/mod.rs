@@ -35,12 +35,15 @@ pub enum DriftCmd {
         #[arg(long, conflicts_with = "against")]
         plan: Option<PathBuf>,
         /// Currently the only valid value is `published-contract`. The
-        /// reference document is read from `--contract-yaml`. Auto-resolution
-        /// from `.jkit/contract.json` lands in a follow-up slice.
+        /// reference document is auto-resolved from `.jkit/contract.json`
+        /// (`contractRepo` URL → shallow git clone → `reference/contract.yaml`)
+        /// unless `--contract-yaml <path>` is given.
         #[arg(long, value_parser = ["published-contract"])]
         against: Option<String>,
-        /// Path to the published `contract.yaml` to diff against. Required
-        /// when `--against published-contract` is set.
+        /// Path to a local `contract.yaml`. When set, skips the
+        /// `.jkit/contract.json` resolution and shallow clone — useful
+        /// for tests, CI fixtures, or when the contract repo is already
+        /// checked out locally.
         #[arg(long = "contract-yaml")]
         contract_yaml: Option<PathBuf>,
         #[arg(long, default_value = "pom.xml")]
@@ -85,11 +88,9 @@ pub fn run(cmd: DriftCmd) -> Result<()> {
         } => match (plan, against, contract_yaml) {
             (Some(plan_path), None, None) => check::run(&plan_path, &pom),
             (None, Some(_), Some(contract_path)) => {
-                check::run_against_contract(&contract_path, &pom)
+                check::run_against_contract_from_file(&contract_path, &pom)
             }
-            (None, Some(_), None) => Err(anyhow::anyhow!(
-                "--against published-contract requires --contract-yaml <path>"
-            )),
+            (None, Some(_), None) => check::run_against_contract_from_repo(&pom),
             (None, None, _) => Err(anyhow::anyhow!(
                 "exactly one of --plan or --against must be supplied"
             )),

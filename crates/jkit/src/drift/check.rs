@@ -310,9 +310,8 @@ fn endpoint_label(method: &str, path: &str) -> String {
 }
 
 /// CLI entry for `--against published-contract --contract-yaml <path>`.
-/// Loads the contract YAML, runs smartdoc, diffs, prints. The plan-mode
-/// twin (`run`) lives above.
-pub fn run_against_contract(contract_path: &Path, pom_path: &Path) -> Result<()> {
+/// Loads the local contract YAML, runs smartdoc, diffs, prints.
+pub fn run_against_contract_from_file(contract_path: &Path, pom_path: &Path) -> Result<()> {
     let cwd = std::env::current_dir().context("reading cwd")?;
     let contract_abs = if contract_path.is_absolute() {
         contract_path.to_path_buf()
@@ -326,24 +325,93 @@ pub fn run_against_contract(contract_path: &Path, pom_path: &Path) -> Result<()>
         .with_context(|| format!("reading {}", contract_abs.display()))?;
     let contract_yaml: YamlValue = serde_yaml::from_str(&contract_text)
         .with_context(|| format!("parsing {} as YAML", contract_abs.display()))?;
-
-    let code_spec = crate::migrate::smartdoc::run_smartdoc(pom_path)?;
-
-    let drift = diff_against_contract(&contract_yaml, &code_spec);
-    let any_issue = drift.iter().any(|f| f.severity == Some("issue"));
-
     let label = contract_abs
         .strip_prefix(&cwd)
         .unwrap_or(&contract_abs)
         .to_string_lossy()
         .into_owned();
+    emit_against_contract(&contract_yaml, pom_path, &label)
+}
 
+/// CLI entry for `--against published-contract` (no `--contract-yaml`).
+/// Reads `contractRepo` from `.jkit/contract.json`, shallow-clones the
+/// remote into a tempdir, and reads `reference/contract.yaml` from
+/// HEAD. The tempdir is dropped when the call returns.
+pub fn run_against_contract_from_repo(pom_path: &Path) -> Result<()> {
+    let cwd = std::env::current_dir().context("reading cwd")?;
+    let contract_repo = read_contract_repo(&cwd)?;
+    let tmp = tempfile::tempdir().context("creating tempdir for contract clone")?;
+    let dest = tmp.path().to_path_buf();
+    let status = std::process::Command::new("git")
+        .args(["clone", "--depth=1", "--quiet", &contract_repo])
+        .arg(&dest)
+        .status()
+        .context("invoking `git clone` for the contract repo")?;
+    if !status.success() {
+        anyhow::bail!(
+            "git clone --depth=1 {} failed; check network access and repo permissions",
+            contract_repo
+        );
+    }
+    let contract_path = dest.join("reference/contract.yaml");
+    if !contract_path.is_file() {
+        anyhow::bail!(
+            "contract repo {} does not contain reference/contract.yaml — has the service been published yet?",
+            contract_repo
+        );
+    }
+    let contract_text = fs::read_to_string(&contract_path)
+        .with_context(|| format!("reading {}", contract_path.display()))?;
+    let contract_yaml: YamlValue = serde_yaml::from_str(&contract_text)
+        .with_context(|| format!("parsing {} as YAML", contract_path.display()))?;
+
+    let label = format!("{contract_repo}#reference/contract.yaml");
+    emit_against_contract(&contract_yaml, pom_path, &label)
+}
+
+fn emit_against_contract(
+    contract: &YamlValue,
+    pom_path: &Path,
+    contract_label: &str,
+) -> Result<()> {
+    let code_spec = crate::migrate::smartdoc::run_smartdoc(pom_path)?;
+    let drift = diff_against_contract(contract, &code_spec);
+    let any_issue = drift.iter().any(|f| f.severity == Some("issue"));
     print_json(&serde_json::json!({
         "ok": !any_issue,
         "mode": "against_published_contract",
-        "contract": label,
+        "contract": contract_label,
         "drift": drift,
     }))
+}
+
+/// Read `contractRepo` from `.jkit/contract.json`. Errors with a remediation
+/// hint when the file is missing or the field is empty.
+fn read_contract_repo(cwd: &Path) -> Result<String> {
+    let path = cwd.join(".jkit/contract.json");
+    if !path.is_file() {
+        anyhow::bail!(
+            ".jkit/contract.json missing — `--against published-contract` needs the contract repo URL. \
+Run `kit contracts bootstrap-marketplace` and `/publish-contract` once, or pass `--contract-yaml <path>` \
+to point at a local copy."
+        );
+    }
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let cfg: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {} as JSON", path.display()))?;
+    let url = cfg
+        .get("contractRepo")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                ".jkit/contract.json missing or empty `contractRepo` — \
+hand-edit the file or pass `--contract-yaml <path>` instead."
+            )
+        })?;
+    Ok(url)
 }
 
 /// Bidirectional diff between a published `contract.yaml` (the last release's
