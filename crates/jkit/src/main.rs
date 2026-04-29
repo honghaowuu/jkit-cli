@@ -51,6 +51,11 @@ enum Top {
         #[command(subcommand)]
         cmd: jkit::domains::DomainsCmd,
     },
+    /// Compact JSON view of one domain (slug + description + use_when +
+    /// scenario summary). Used by spec-delta clarification, writing-plans,
+    /// and java-tdd to gather per-domain context without per-file reads.
+    #[command(name = "domain-context")]
+    DomainContext(jkit::domain_context::DomainContextArgs),
     /// One-shot project bootstrap: changes bootstrap + standards init + scaffold.
     /// Idempotent — re-running completes only what's missing.
     Init {
@@ -73,6 +78,7 @@ fn main() -> ExitCode {
         Top::Changes { cmd } => jkit::changes::run(cmd),
         Top::Standards { cmd } => jkit::standards::run(cmd),
         Top::Domains { cmd } => jkit::domains::run(cmd),
+        Top::DomainContext(args) => jkit::domain_context::run(args),
         Top::Init { cmd } => match cmd {
             Some(c) => jkit::init::run(c),
             None => jkit::init::run_umbrella(),

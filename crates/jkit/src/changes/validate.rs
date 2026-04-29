@@ -71,10 +71,10 @@ fn validate_one(cwd: &Path, path: &Path) -> FileResult {
         match serde_yaml::from_str::<serde_yaml::Value>(fm) {
             Ok(value) => {
                 if let Some(domain) = value.get("domain").and_then(|v| v.as_str()) {
-                    let domain_dir = cwd.join("docs/domains").join(domain);
-                    if !domain_dir.is_dir() {
+                    if !domain_in_index(cwd, domain) {
                         errors.push(format!(
-                            "frontmatter domain '{}' does not exist at docs/domains/{}/",
+                            "frontmatter domain '{}' is not declared in docs/domains.yaml — \
+add it with `jkit domains add --slug {} --description <d> --use-when <w>`",
                             domain, domain
                         ));
                     }
@@ -114,6 +114,17 @@ fn split_frontmatter(s: &str) -> (Option<&str>, &str) {
         }
     }
     (None, s)
+}
+
+/// True when the slug appears under `domains:` in `docs/domains.yaml`.
+/// Returns false on missing/malformed file (we don't surface that detail
+/// here — `jkit domains doctor` is the diagnostic entry point).
+fn domain_in_index(cwd: &Path, slug: &str) -> bool {
+    use crate::domains::yaml::DomainsFile;
+    match DomainsFile::load(cwd) {
+        Ok(f) => f.get(slug).is_some(),
+        Err(_) => false,
+    }
 }
 
 fn list_pending_paths(cwd: &Path) -> Result<Vec<PathBuf>> {
@@ -156,6 +167,16 @@ mod tests {
         assert!(out.valid, "{:?}", out);
     }
 
+    fn write_domains_yaml(tmp: &Path, slugs: &[&str]) {
+        let mut yaml = String::from("domains:\n");
+        for s in slugs {
+            yaml.push_str(&format!(
+                "  {s}:\n    description: x\n    use_when: x\n"
+            ));
+        }
+        write(&tmp.join("docs/domains.yaml"), &yaml);
+    }
+
     #[test]
     fn empty_body_is_rejected() {
         let tmp = tempdir().unwrap();
@@ -163,7 +184,7 @@ mod tests {
             &tmp.path().join("docs/changes/pending/x.md"),
             "---\ndomain: billing\n---\n\n   \n",
         );
-        write(&tmp.path().join("docs/domains/billing/api-spec.yaml"), "");
+        write_domains_yaml(tmp.path(), &["billing"]);
         let out = compute(
             tmp.path(),
             &[PathBuf::from("docs/changes/pending/x.md")],
@@ -173,12 +194,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_domain_dir_is_rejected() {
+    fn frontmatter_slug_not_in_domains_yaml_is_rejected() {
         let tmp = tempdir().unwrap();
         write(
             &tmp.path().join("docs/changes/pending/x.md"),
             "---\ndomain: nonsense\n---\n\nA real body paragraph.\n",
         );
+        write_domains_yaml(tmp.path(), &["billing"]);
         let out = compute(
             tmp.path(),
             &[PathBuf::from("docs/changes/pending/x.md")],
@@ -187,22 +209,41 @@ mod tests {
         assert!(out.files[0]
             .errors
             .iter()
-            .any(|e| e.contains("'nonsense'") && e.contains("does not exist")));
+            .any(|e| e.contains("'nonsense'") && e.contains("docs/domains.yaml")));
     }
 
     #[test]
-    fn present_domain_dir_passes() {
+    fn frontmatter_slug_in_domains_yaml_passes() {
         let tmp = tempdir().unwrap();
         write(
             &tmp.path().join("docs/changes/pending/x.md"),
             "---\ndomain: billing\n---\n\nA real body paragraph.\n",
         );
-        fs::create_dir_all(tmp.path().join("docs/domains/billing")).unwrap();
+        write_domains_yaml(tmp.path(), &["billing"]);
         let out = compute(
             tmp.path(),
             &[PathBuf::from("docs/changes/pending/x.md")],
         );
         assert!(out.valid, "{:?}", out);
+    }
+
+    #[test]
+    fn missing_domains_yaml_rejects_any_frontmatter_slug() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join("docs/changes/pending/x.md"),
+            "---\ndomain: billing\n---\n\nA real body paragraph.\n",
+        );
+        // No docs/domains.yaml at all.
+        let out = compute(
+            tmp.path(),
+            &[PathBuf::from("docs/changes/pending/x.md")],
+        );
+        assert!(!out.valid);
+        assert!(out.files[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("docs/domains.yaml")));
     }
 
     #[test]

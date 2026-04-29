@@ -238,7 +238,7 @@ pub fn count_gaps_per_domain(
 }
 
 /// Walk the test root, collect every method name appearing in `void <name>(`.
-fn implemented_method_names(test_root: &Path) -> Result<HashSet<String>> {
+pub(crate) fn implemented_method_names(test_root: &Path) -> Result<HashSet<String>> {
     let mut set = HashSet::new();
     if !test_root.exists() {
         return Ok(set);
