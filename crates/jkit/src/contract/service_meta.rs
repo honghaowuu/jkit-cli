@@ -23,7 +23,20 @@ pub struct ServiceMeta {
     pub controllers: Vec<Controller>,
     pub javadoc_quality: JavadocSummary,
     pub interview_drafts: InterviewDrafts,
+    /// Per-slug entries from `docs/domains.yaml` for every slug present in
+    /// `controllers[].domain_slug`. Empty when `domains.yaml` is absent or
+    /// has no overlap with the controller set. publish-contract Step 4 reads
+    /// this for richer interview defaults than the Javadoc-derived ones in
+    /// `interview_drafts`.
+    pub domains: Vec<DomainEntry>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct DomainEntry {
+    pub slug: String,
+    pub description: String,
+    pub use_when: String,
 }
 
 #[derive(Serialize)]
@@ -155,7 +168,15 @@ pub fn compute(pom_path: &Path, src_root: &Path) -> Result<ServiceMeta> {
     let sdk = detect_sdk(pom_path, &coords);
     let authentication_hint = detect_auth_hint(src_root);
 
-    let drafts = build_drafts(&service_name, &controllers);
+    let mut drafts = build_drafts(&service_name, &controllers);
+
+    // Merge docs/domains.yaml into drafts and the new top-level `domains[]`.
+    // For each unique controller domain_slug present in domains.yaml, emit a
+    // DomainEntry. When there's exactly one such slug, also replace the
+    // Javadoc-derived `description` / `use_when` drafts with the curated
+    // values — the spec calls these out as authoritative for the
+    // single-domain-contract case.
+    let domains = collect_domains(project_root, &controllers, &mut drafts);
 
     Ok(ServiceMeta {
         service_name,
@@ -174,8 +195,44 @@ pub fn compute(pom_path: &Path, src_root: &Path) -> Result<ServiceMeta> {
             thin,
         },
         interview_drafts: drafts,
+        domains,
         warnings,
     })
+}
+
+fn collect_domains(
+    project_root: &Path,
+    controllers: &[Controller],
+    drafts: &mut InterviewDrafts,
+) -> Vec<DomainEntry> {
+    let file = match crate::domains::yaml::DomainsFile::load(project_root) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut unique_slugs: Vec<String> = Vec::new();
+    for c in controllers {
+        if !unique_slugs.contains(&c.domain_slug) {
+            unique_slugs.push(c.domain_slug.clone());
+        }
+    }
+    let mut out: Vec<DomainEntry> = Vec::new();
+    for slug in &unique_slugs {
+        if let Some(entry) = file.get(slug) {
+            if let (Some(desc), Some(uw)) = (entry.description.clone(), entry.use_when.clone()) {
+                out.push(DomainEntry {
+                    slug: slug.clone(),
+                    description: desc,
+                    use_when: uw,
+                });
+            }
+        }
+    }
+    if out.len() == 1 {
+        let only = &out[0];
+        drafts.description = only.description.clone();
+        drafts.use_when = vec![only.use_when.clone()];
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
