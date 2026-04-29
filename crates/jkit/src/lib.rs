@@ -1,6 +1,5 @@
 pub mod api_spec;
 pub mod changes;
-pub mod conflicts;
 pub mod contract;
 pub mod coverage;
 pub mod domain_context;
