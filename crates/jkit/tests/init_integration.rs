@@ -33,9 +33,6 @@ fn init_umbrella_creates_full_layout() {
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(json["ok"], true);
 
-    let cb = &json["steps"]["changes_bootstrap"];
-    assert_eq!(cb["created"].as_array().unwrap().len(), 2);
-
     let si = &json["steps"]["standards_init"];
     assert_eq!(si["created"], serde_json::json!(["docs/project-info.yaml"]));
 
@@ -43,7 +40,7 @@ fn init_umbrella_creates_full_layout() {
     assert_eq!(sc["created"].as_array().unwrap().len(), 5);
     assert_eq!(
         sc["gitignore_added"],
-        serde_json::json!([".env/", "target/", ".jkit/done/"])
+        serde_json::json!([".env/", "target/"])
     );
 
     let next: Vec<&str> = json["next_steps"]
@@ -54,11 +51,9 @@ fn init_umbrella_creates_full_layout() {
         .collect();
     assert!(next.iter().any(|s| s.contains("project-info.yaml")));
     assert!(next.iter().any(|s| s.contains("overview.md")));
-    assert!(next.iter().any(|s| s.contains("/write-change")));
+    assert!(next.iter().any(|s| s.contains("/start-feature")));
 
     for rel in [
-        "docs/changes/pending/.gitkeep",
-        "docs/changes/done/.gitkeep",
         "docs/project-info.yaml",
         ".envrc",
         ".env/local.env",
@@ -73,6 +68,8 @@ fn init_umbrella_creates_full_layout() {
             rel
         );
     }
+    // The pending/done inboxes are gone — branches replace them.
+    assert!(!tmp.path().join("docs/changes").exists());
 }
 
 #[test]
@@ -94,10 +91,6 @@ fn init_umbrella_idempotent() {
     assert!(out.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(json["steps"]["changes_bootstrap"]["created"]
-        .as_array()
-        .unwrap()
-        .is_empty());
     assert!(json["steps"]["standards_init"]["created"]
         .as_array()
         .unwrap()
@@ -124,7 +117,6 @@ fn init_scaffold_subcommand_only_runs_scaffold_step() {
 
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["created"].as_array().unwrap().len(), 5);
-    // Did NOT run changes::bootstrap or standards::init.
-    assert!(!tmp.path().join("docs/changes/pending/.gitkeep").exists());
+    // Did NOT run standards::init.
     assert!(!tmp.path().join("docs/project-info.yaml").exists());
 }

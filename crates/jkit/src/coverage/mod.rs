@@ -48,8 +48,7 @@ pub struct CoverageArgs {
     /// `.`-separated segment. Strategies:
     ///
     ///   - `domains:<comma-list>` — explicit domain slugs
-    ///   - `run:<dir>` — read `<dir>/change-summary.md` and use its
-    ///     `## Domains Changed` table
+    ///   - `run:<dir>` — read `<dir>/design.md` frontmatter `domains: [...]`
     ///
     /// Without `--scope`, the gap report covers every class in the JaCoCo
     /// XML. The summary (line counts / overall %) is always project-wide
@@ -192,8 +191,7 @@ pub fn run(args: CoverageArgs) -> Result<()> {
 
 /// Resolve a `--scope` argument into a list of domain slugs. Strategies:
 ///   - `domains:<comma-list>` — explicit domain slugs
-///   - `run:<dir>` — read `<dir>/change-summary.md` and parse its
-///     `## Domains Changed` table (same parser as `jkit scenarios gap --run`)
+///   - `run:<dir>` — read `<dir>/design.md` frontmatter `domains: [...]`
 fn parse_scope(value: &str) -> Result<Vec<String>> {
     if let Some(rest) = value.strip_prefix("domains:") {
         let domains: Vec<String> = rest
@@ -207,15 +205,14 @@ fn parse_scope(value: &str) -> Result<Vec<String>> {
         Ok(domains)
     } else if let Some(rest) = value.strip_prefix("run:") {
         let run_dir = std::path::PathBuf::from(rest);
-        let cs_path = run_dir.join("change-summary.md");
-        let cs_text = fs::read_to_string(&cs_path)
-            .with_context(|| format!("reading {}", cs_path.display()))?;
-        crate::scenarios::gap::parse_affected_domains(&cs_text).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}: no `## Domains Changed` table found",
-                cs_path.display()
-            )
-        })
+        let design = crate::design::read_design(&run_dir)?;
+        if design.domains.is_empty() {
+            anyhow::bail!(
+                "{}/design.md frontmatter `domains:` is empty",
+                run_dir.display()
+            );
+        }
+        Ok(design.domains)
     } else {
         anyhow::bail!(
             "unknown --scope strategy `{}`; expected `domains:<comma-list>` or `run:<dir>`",
@@ -428,12 +425,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_scope_run_reads_change_summary() {
+    fn parse_scope_run_reads_design_md() {
         let tmp = tempdir().unwrap();
-        let cs = tmp.path().join("change-summary.md");
+        let path = tmp.path().join("design.md");
         fs::write(
-            &cs,
-            "# Title\n\n## Domains Changed\n\n| Domain | x |\n|---|---|\n| greeting | a |\n| billing | b |\n",
+            &path,
+            "---\nfeature: x\ndomains: [greeting, billing]\n---\n\n# Title\n",
         )
         .unwrap();
         let v = parse_scope(&format!("run:{}", tmp.path().display())).unwrap();
@@ -441,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_scope_run_missing_summary_errors() {
+    fn parse_scope_run_missing_design_errors() {
         let tmp = tempdir().unwrap();
         assert!(parse_scope(&format!("run:{}", tmp.path().display())).is_err());
     }

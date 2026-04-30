@@ -35,9 +35,11 @@ enum Top {
         #[command(subcommand)]
         cmd: jkit::contract::ContractCmd,
     },
-    Changes {
+    /// Branch-driven entry routing for `/start-feature`: detect git branch
+    /// state, run the domain doctor, create + rename the feature branch.
+    Feature {
         #[command(subcommand)]
-        cmd: jkit::changes::ChangesCmd,
+        cmd: jkit::feature::FeatureCmd,
     },
     Standards {
         #[command(subcommand)]
@@ -66,7 +68,7 @@ enum Top {
         #[command(subcommand)]
         cmd: jkit::api_spec::ApiSpecCmd,
     },
-    /// One-shot project bootstrap: changes bootstrap + standards init + scaffold.
+    /// One-shot project bootstrap: standards init + scaffold.
     /// Idempotent — re-running completes only what's missing.
     Init {
         #[command(subcommand)]
@@ -84,7 +86,7 @@ fn main() -> ExitCode {
         Top::Migrate { cmd } => jkit::migrate::run(cmd),
         Top::Migration { cmd } => jkit::migration::run(cmd),
         Top::Contract { cmd } => jkit::contract::run(cmd),
-        Top::Changes { cmd } => jkit::changes::run(cmd),
+        Top::Feature { cmd } => jkit::feature::run(cmd),
         Top::Standards { cmd } => jkit::standards::run(cmd),
         Top::Domains { cmd } => jkit::domains::run(cmd),
         Top::Permissions { cmd } => jkit::permissions::run(cmd),

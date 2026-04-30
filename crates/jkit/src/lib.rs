@@ -1,12 +1,13 @@
 pub mod api_spec;
-pub mod changes;
 pub mod contract;
 pub mod coverage;
+pub mod design;
 pub mod domain_context;
 pub mod domain_layout;
 pub mod domains;
 pub mod drift;
 pub mod envelope;
+pub mod feature;
 pub mod init;
 pub mod migrate;
 pub mod migration;

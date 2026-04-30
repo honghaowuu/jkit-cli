@@ -12,7 +12,7 @@ const OVERVIEW_MD: &str = include_str!("../../templates/scaffold/overview.md");
 
 const GITIGNORE_FENCE_START: &str = "# --- jkit-managed (do not edit between markers) ---";
 const GITIGNORE_FENCE_END: &str = "# --- end jkit-managed ---";
-const GITIGNORE_ENTRIES: &[&str] = &[".env/", "target/", ".jkit/done/"];
+const GITIGNORE_ENTRIES: &[&str] = &[".env/", "target/"];
 
 #[derive(Serialize, Debug)]
 pub struct ScaffoldReport {
@@ -189,7 +189,7 @@ mod tests {
         let r = scaffold(tmp.path()).unwrap();
         assert_eq!(r.created.len(), 5);
         assert!(r.existing.is_empty());
-        assert_eq!(r.gitignore_added, vec![".env/", "target/", ".jkit/done/"]);
+        assert_eq!(r.gitignore_added, vec![".env/", "target/"]);
         assert!(tmp.path().join(".envrc").is_file());
         assert!(tmp.path().join(".env/local.env").is_file());
         assert!(tmp.path().join(".env/test.env").is_file());
@@ -229,7 +229,6 @@ mod tests {
         assert!(after.contains("build/"));
         assert!(after.contains(".env/"));
         assert!(after.contains("target/"));
-        assert!(after.contains(".jkit/done/"));
     }
 
     #[test]
@@ -244,7 +243,7 @@ mod tests {
         let after = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert!(!after.contains("stale-entry"));
         assert!(after.contains(".env/"));
-        assert_eq!(r.gitignore_added, vec![".env/", "target/", ".jkit/done/"]);
+        assert_eq!(r.gitignore_added, vec![".env/", "target/"]);
     }
 
     #[test]
@@ -265,7 +264,7 @@ mod tests {
         );
         fs::write(tmp.path().join(".gitignore"), &pre).unwrap();
         let r = scaffold(tmp.path()).unwrap();
-        assert_eq!(r.gitignore_added, vec!["target/", ".jkit/done/"]);
+        assert_eq!(r.gitignore_added, vec!["target/"]);
     }
 
     #[test]

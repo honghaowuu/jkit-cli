@@ -80,9 +80,9 @@ struct LiveColumn {
 }
 
 pub fn run(run_dir: &Path, no_db: bool, pom_path: &Path, target_override: Option<&Path>) -> Result<()> {
-    let cs_path = run_dir.join("change-summary.md");
-    if !cs_path.exists() {
-        anyhow::bail!("change-summary.md missing in {}", run_dir.display());
+    let design_path = run_dir.join("design.md");
+    if !design_path.exists() {
+        anyhow::bail!("design.md missing in {}", run_dir.display());
     }
     let target_path = target_override
         .map(|p| p.to_path_buf())

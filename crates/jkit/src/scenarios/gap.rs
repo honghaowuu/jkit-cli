@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use heck::{ToLowerCamelCase, ToPascalCase};
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -109,14 +108,14 @@ fn run_aggregated(
     test_root: &Path,
     pom_path: &Path,
 ) -> Result<()> {
-    let cs_path = run_dir.join("change-summary.md");
-    if !cs_path.exists() {
-        anyhow::bail!("change-summary.md missing in {}", run_dir.display());
+    let design = crate::design::read_design(run_dir)?;
+    if design.domains.is_empty() {
+        anyhow::bail!(
+            "{}/design.md frontmatter `domains:` is empty",
+            run_dir.display()
+        );
     }
-    let cs_text =
-        fs::read_to_string(&cs_path).with_context(|| format!("reading {}", cs_path.display()))?;
-    let domains = parse_affected_domains(&cs_text)
-        .ok_or_else(|| anyhow::anyhow!("change-summary.md: '## Domains Changed' section not found"))?;
+    let domains = design.domains;
 
     let skipped: HashSet<(String, String, String)> =
         load_skip_records(&[run_dir.to_path_buf()])?;
@@ -267,78 +266,6 @@ pub(crate) fn implemented_method_names(test_root: &Path) -> Result<HashSet<Strin
     Ok(set)
 }
 
-/// Parse the first column of the markdown table under `## Domains Changed`.
-pub fn parse_affected_domains(md: &str) -> Option<Vec<String>> {
-    let parser = Parser::new_ext(md, Options::ENABLE_TABLES);
-    let mut in_section = false;
-    let mut current_heading_text = String::new();
-    let mut in_heading = false;
-    let mut in_table = false;
-    let mut in_head = false;
-    let mut col_idx: usize = 0;
-    let mut current_cell = String::new();
-    let mut domains: Vec<String> = Vec::new();
-
-    for ev in parser {
-        match ev {
-            Event::Start(Tag::Heading { .. }) => {
-                in_heading = true;
-                current_heading_text.clear();
-            }
-            Event::End(TagEnd::Heading(_)) => {
-                in_heading = false;
-                let lower = current_heading_text.trim().to_lowercase();
-                if lower == "domains changed" {
-                    in_section = true;
-                } else if in_section {
-                    in_section = false;
-                }
-            }
-            Event::Start(Tag::Table(_)) if in_section => {
-                in_table = true;
-            }
-            Event::End(TagEnd::Table) if in_section => {
-                in_table = false;
-            }
-            Event::Start(Tag::TableHead) if in_table => {
-                in_head = true;
-                col_idx = 0;
-            }
-            Event::End(TagEnd::TableHead) if in_table => {
-                in_head = false;
-            }
-            Event::Start(Tag::TableRow) if in_table => {
-                col_idx = 0;
-            }
-            Event::Start(Tag::TableCell) if in_table => {
-                current_cell.clear();
-            }
-            Event::End(TagEnd::TableCell) if in_table => {
-                if !in_head && col_idx == 0 {
-                    let v = current_cell.trim().to_string();
-                    if !v.is_empty() {
-                        domains.push(v);
-                    }
-                }
-                col_idx += 1;
-            }
-            Event::Text(t) | Event::Code(t) => {
-                if in_heading {
-                    current_heading_text.push_str(&t);
-                } else if in_table {
-                    current_cell.push_str(&t);
-                }
-            }
-            _ => {}
-        }
-    }
-    if domains.is_empty() {
-        None
-    } else {
-        Some(domains)
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PomCoords {
     group_id: String,
@@ -425,13 +352,6 @@ mod tests {
         assert_eq!(id_to_camel("happy-path"), "happyPath");
         assert_eq!(id_to_camel("validation-empty-list"), "validationEmptyList");
         assert_eq!(id_to_camel("single"), "single");
-    }
-
-    #[test]
-    fn parses_domains_table() {
-        let md = "# Foo\n\n## Domains Changed\n\n| Domain | Notes |\n|---|---|\n| billing | new endpoint |\n| inventory | tweak |\n\n## Other\n";
-        let v = parse_affected_domains(md).unwrap();
-        assert_eq!(v, vec!["billing", "inventory"]);
     }
 
     #[test]

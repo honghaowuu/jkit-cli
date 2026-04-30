@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use serde::Serialize;
 
-use crate::changes::bootstrap::{self, BootstrapReport};
 use crate::standards::init::{self as standards_init, StandardsInitReport};
 use crate::util::print_json;
 
@@ -24,17 +23,15 @@ struct InitReport {
 
 #[derive(Serialize, Debug)]
 struct Steps {
-    changes_bootstrap: BootstrapReport,
     standards_init: StandardsInitReport,
     scaffold: scaffold::ScaffoldReport,
 }
 
-/// `jkit init` umbrella: runs `changes bootstrap` + `standards init` + `scaffold`,
-/// merges per-step reports, prints a single JSON document with `next_steps`.
+/// `jkit init` umbrella: runs `standards init` + `scaffold`, merges per-step
+/// reports, prints a single JSON document with `next_steps`.
 pub fn run_umbrella() -> Result<()> {
     let cwd = std::env::current_dir().context("reading cwd")?;
 
-    let changes_bootstrap = bootstrap::bootstrap(&cwd)?;
     let standards_init = standards_init::init(&cwd, false)?;
     let scaffold = scaffold::scaffold(&cwd)?;
 
@@ -42,7 +39,6 @@ pub fn run_umbrella() -> Result<()> {
 
     let report = InitReport {
         steps: Steps {
-            changes_bootstrap,
             standards_init,
             scaffold,
         },
@@ -80,7 +76,7 @@ fn compose_next_steps(
         );
     }
     steps.push(
-        "Run /write-change to author your first change file".to_string(),
+        "Run /start-feature to begin a new feature".to_string(),
     );
     steps
 }
